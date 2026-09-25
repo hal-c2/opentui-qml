@@ -338,3 +338,94 @@ Keyboard interaction via `mockInput.pressKey("ARROW_DOWN")` / `typeText`.
 States/Transitions/Behaviors/animations, anchors beyond `fill`/`centerIn`, `Loader` async, QML
 modules with `qmldir`, JS `.import`/`.js` library files (nice-to-have: `import "foo.js" as Foo`),
 `ListView` delegates rendering custom items (Select owns rendering), `MouseArea` (mouse handlers are on Item).
+
+## Keymap (`src/components/keymap.ts`)
+
+Goal: keyboard shortcuts are declared in QML (so users can re-bind them) and the host app can
+override them from TypeScript. Built on OpenTUI's key helpers from `@opentui/core`
+(`parseKeyBinding`-style string → `{ name, ctrl, shift, meta, super }`, `defaultKeyAliases`,
+`matchesKeyBinding`, `keyBindingToString`).
+
+Key strings: `"ctrl+s"`, `"shift+tab"`, `"alt+enter"` (alt = meta), `"escape"`/`"esc"`,
+`"return"`/`"enter"`, `"space"`, `"up"`, `"pageup"`, `"f5"`, single chars `"q"`, `"?"`.
+Case-insensitive modifiers; `"Ctrl+S"` == `"ctrl+s"`. Export `parseKeySequence(str)` and
+`keyEventMatches(event, parsed)`.
+
+Types:
+
+```qml
+// Qt-compatible: fires when the key is pressed anywhere in the app (context "application")
+// or, with context "item", only while the enclosing Item has focus.
+Shortcut {
+    sequence: "ctrl+s"              // or sequences: ["ctrl+s", "f2"]
+    enabled: true
+    context: "application"          // "application" | "item"   (default application)
+    autoRepeat: true                // ignore "repeat" key events when false
+    onActivated: save()
+}
+
+// A named action table users can edit. Bindings are a JS object or KeyBinding children.
+Keymap {
+    id: keys
+    bindings: ({ "ctrl+s": "save", "q": "quit", "escape": "quit", "?": "help" })
+    KeyBinding { keys: "ctrl+r"; action: "reload"; description: "Reload the file" }
+    onActivated: (action, event) => { ... }     // fires for every matched action
+    onSave: ...                                 // NOT supported (actions are dynamic) — use onActivated or `handlers`
+    handlers: ({ save: () => save(), quit: () => Qt.quit() })   // optional per-action functions
+    enabled: true
+    priority: 0                                 // higher priority keymaps see the key first
+}
+```
+
+Semantics: on each `keypress`, active Keymaps/Shortcuts are checked in priority order (then
+document order); the first match runs its handler and calls `event.stopPropagation()` +
+`preventDefault()` unless the handler sets `event.accepted = false`. `Keymap.bindings` can be
+replaced at runtime (`keys.bindings = {...}`) and can be loaded from JSON:
+`runQml(file, { keymap: { "ctrl+s": "save" } })` merges into every `Keymap { id: ... }` whose
+`name` matches (`Keymap { name: "main" }` ↔ `keymap: { main: {...} }`; unnamed keymap ↔ top-level
+object). `Keymap.describe()` returns `[{ keys, action, description }]` for help screens.
+Component keybindings: `ListView`/`TabBar`/`TextInput`/`TextArea` expose a `keyBindings`
+property passed through to the renderable (`[{ name: "j", action: "move-down" }]`) and a
+`keyAliasMap` passthrough.
+
+## Plugins (`src/runtime/plugins.ts`, `src/components/slot.ts`)
+
+OpenTUI ships a slot-based plugin system (`createCoreSlotRegistry`, `registerCorePlugin`,
+`SlotRenderable` in `@opentui/core`): a plugin is `{ id, order?, setup?, dispose?, slots: { [name]: (ctx, data) => Renderable } }`
+and a `SlotRenderable({ registry, name, data?, mode: "append"|"replace"|"single_winner", fallback? })`
+mounts every contribution for `name` at that point in the tree, re-resolving when the registry
+changes. We expose exactly this to QML:
+
+- The engine owns one `CoreSlotRegistry` (`engine.slots`), created lazily with the renderer and a
+  context `{ engine, root, ...userContext }`.
+- **`Slot`** visual type wraps `SlotRenderable`: `Slot { name: "sidebar"; mode: "append"; data: ({...}) }`.
+  Children declared inside the `Slot` are its fallback (shown when no plugin contributes).
+  `data` is reactive: setting it updates `slotRenderable.data` (which triggers re-render of contributions).
+- **TypeScript plugins**: `runQml(file, { plugins: [plugin, ...] })` or `engine.registerPlugin(plugin)`
+  where `plugin` is an OpenTUI `CorePlugin`. Slot renderers receive `(ctx, data)` and return a
+  Renderable; they may also return a **QmlObject** (we unwrap `.renderable`) or a **QML source string**
+  (we instantiate it with the slot `data` as context properties) — helper `engine.createFromSource(src, parent?, ctx?)`.
+- **QML plugins**: a `.qml` file whose root is `Plugin`:
+
+  ```qml
+  import OpenTUI
+  Plugin {
+      id: "wordcount"          // plugin id (string property, not a QML id)
+      order: 10
+      Contribution {
+          slot: "statusbar"
+          Text { text: "words: " + data.words }      // `data` = the Slot's data; `plugin`, `engine` also in scope
+      }
+      Contribution { slot: "sidebar"; mode: "managed"; Item { ... } }
+      Component.onCompleted: console.log("plugin loaded")   // = setup
+      Component.onDestruction: ...                          // = dispose
+  }
+  ```
+  Loaded with `runQml(file, { plugins: ["./plugins/wordcount.qml"] })`, `{ pluginDirs: ["./plugins"] }`
+  (every `*.qml` in the dir whose root is `Plugin`), or `engine.loadPlugin(path)`. Each
+  `Contribution`'s single child object is a delegate (uninstantiated `Component`) instantiated per
+  slot mount with context `{ data, plugin, slot }`; the instance is destroyed when the slot unmounts.
+  Plugins can also contribute **keymaps** (`Keymap {}` / `Shortcut {}` children of `Plugin` are
+  global) and **types** (`Plugin { types: ["./Widget.qml"] }` registers extra QML types).
+- `engine.unregisterPlugin(id)`, `engine.plugins` (list), `pluginError` signal on the root for
+  failures (also logged). Plugin failures never crash the host: `SlotRegistry` already isolates them.
