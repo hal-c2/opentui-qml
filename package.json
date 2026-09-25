@@ -1,0 +1,35 @@
+{
+  "name": "opentui-qml",
+  "version": "0.1.0",
+  "description": "A QML runtime for OpenTUI: write terminal UIs in QML, render them with @opentui/core",
+  "type": "module",
+  "main": "src/index.ts",
+  "module": "src/index.ts",
+  "types": "src/index.ts",
+  "bin": {
+    "opentui-qml": "src/cli.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./parser": "./src/parser/index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "example": "bun run src/cli.ts"
+  },
+  "keywords": ["qml", "opentui", "tui", "terminal"],
+  "license": "MIT",
+  "dependencies": {
+    "@opentui/core": "^0.5.12",
+    "solid-js": "1.9.12"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  },
+  "engines": {
+    "bun": ">=1.3.0",
+    "node": ">=26.4.0"
+  }
+}
