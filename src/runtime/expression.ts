@@ -59,7 +59,8 @@ export interface CompiledScript {
 
 type RawScript = (this: unknown, scope: object, args: readonly unknown[]) => unknown
 
-const cache = new Map<string, RawScript>()
+/** Compiled functions keyed by kind + source (shared by all objects using the same text). */
+const cache = new Map<string, { fn: RawScript; isBlock: boolean }>()
 
 function build(body: string): RawScript {
   // eslint-disable-next-line @typescript-eslint/no-implied-eval
@@ -73,7 +74,7 @@ function build(body: string): RawScript {
 function compileRaw(source: string, isBlock: boolean): { fn: RawScript; isBlock: boolean } {
   const key = (isBlock ? "B:" : "E:") + source
   const hit = cache.get(key)
-  if (hit) return { fn: hit, isBlock }
+  if (hit) return hit
   let fn: RawScript
   if (isBlock) {
     fn = build(source)
@@ -84,12 +85,13 @@ function compileRaw(source: string, isBlock: boolean): { fn: RawScript; isBlock:
       // Not a single expression (e.g. `foo(); bar()`): fall back to statements.
       if (!(err instanceof SyntaxError)) throw err
       const block = compileRaw(source, true)
-      cache.set(key, block.fn)
+      cache.set(key, block)
       return block
     }
   }
-  cache.set(key, fn)
-  return { fn, isBlock }
+  const entry = { fn, isBlock }
+  cache.set(key, entry)
+  return entry
 }
 
 /**

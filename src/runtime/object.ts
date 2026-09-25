@@ -188,7 +188,12 @@ export class QmlObject {
    * Used by e.g. ListElement.
    */
   allowDynamicProperties = false
-  /** Name of the `default property`, if the document declared one. */
+  /**
+   * Name of the `default property`: set by the engine when a document declares one, or by a
+   * native type in its constructor. For native types, inline child objects go to this property
+   * instead of `children`: a Component-typed one captures the child as a Component (Repeater's
+   * `delegate`), anything else receives the child's proxy (appended for list properties).
+   */
   defaultPropertyName: string | null = null
 
   private readonly props = new Map<string, PropertySlot>()
@@ -267,7 +272,7 @@ export class QmlObject {
     const at = index === undefined || index > len ? len : Math.max(0, Math.trunc(index))
     this.children.splice(at, 0, child)
     child._parent = this
-    child.storeParent(this)
+    child.storeParent(() => this as QmlObject)
     this.storeChildrenVersion((v) => v + 1)
     untrack(() => this.onChildAdded(child, at))
   }

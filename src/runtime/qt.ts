@@ -22,7 +22,7 @@ export interface QtGlobal {
   darker(color: unknown, factor?: number): string
   /** Lighter color (HSV value multiplied by `factor`, default 1.5). */
   lighter(color: unknown, factor?: number): string
-  /** Blend two colors: `a * (1 - t) + b * t`... returns `"#rrggbbaa"`. */
+  /** Overlay `tint` on `base` using the tint's alpha (`base * (1 - a) + tint * a`); returns `"#rrggbbaa"`. */
   tint(base: unknown, tint: unknown): string
   colorEqual(a: unknown, b: unknown): boolean
   /** Basic Qt date formatting (`yyyy MM dd hh mm ss zzz AP`). */
