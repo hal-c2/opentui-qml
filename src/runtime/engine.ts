@@ -126,6 +126,8 @@ export class QmlEngine {
   readonly rootContext: ComponentContext = createComponentContext(null)
 
   private readonly types = new Map<string, QmlTypeFactory>()
+  /** Named document types (`registerDocumentType`), e.g. `types: [...]` of a QML plugin. */
+  private readonly documentTypes = new Map<string, QmlComponent>()
   private readonly files = new Map<string, QmlComponent | null>()
   private readonly scopes = new WeakMap<QmlObject, Map<ComponentContext, QmlScope>>()
   private readonly defaultProps = new WeakMap<QmlObject, DefaultPropertyInfo>()
@@ -194,8 +196,21 @@ export class QmlEngine {
     this.types.set(name, type)
   }
 
+  /**
+   * Register (or replace) a document type: `name` resolves to `component` (a loaded `.qml`
+   * document) in every document, like a sibling `Name.qml` file. Native types of the same name
+   * take precedence. Used by QML plugins' `types: [...]`.
+   */
+  registerDocumentType(name: string, component: QmlComponent): void {
+    this.documentTypes.set(name, component)
+  }
+
+  getDocumentType(name: string): QmlComponent | undefined {
+    return this.documentTypes.get(name)
+  }
+
   hasType(name: string): boolean {
-    return this.types.has(name)
+    return this.types.has(name) || this.documentTypes.has(name)
   }
 
   getType(name: string): QmlTypeFactory | undefined {
@@ -783,6 +798,8 @@ export class QmlComponent {
 
   private fromRegistry(name: string): ResolvedType | undefined {
     const factory = this.engine.getType(name)
-    return factory ? { kind: "native", name, factory } : undefined
+    if (factory) return { kind: "native", name, factory }
+    const doc = this.engine.getDocumentType(name)
+    return doc ? { kind: "document", name, component: doc } : undefined
   }
 }

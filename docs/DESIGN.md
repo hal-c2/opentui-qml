@@ -303,27 +303,48 @@ renderable's `onSizeChange`/lifecycle pass so `width: parent.layoutWidth - 4` st
 ## Public API (`src/index.ts`)
 
 ```ts
-export async function runQml(file: string, options?: {
+export async function runQml(file: string, options?: RunQmlOptions): Promise<QmlApp>
+export async function runQmlSource(source: string, options?: RunQmlOptions & { filename?: string }): Promise<QmlApp>
+
+export interface RunQmlOptions {
   renderer?: CliRenderer                  // default: createCliRenderer(rendererConfig)
   rendererConfig?: CliRendererConfig
-  context?: Record<string, unknown>       // globals visible in QML
+  context?: Record<string, unknown>       // globals visible in QML (and in the plugin context)
   types?: Record<string, QmlTypeFactory>  // extra types
-}): Promise<QmlApp>
+  plugins?: (AnyPlugin | string)[]        // TS plugins, or paths of QML plugin files (relative to cwd)
+  pluginDirs?: string[]                   // dirs whose *.qml files with a Plugin root are loaded (relative to cwd)
+  keymap?: Record<string, unknown>        // overrides merged into the document's Keymaps
+  basePath?: string                       // default: the file's directory (source: cwd)
+  scheduler?: Scheduler
+  onWarning?: (message: string) => void
+  onError?: (error: unknown, context?: string) => void
+}
 
 export interface QmlApp {
   engine: QmlEngine
   root: QmlObject          // the instantiated root object (root.proxy for property access)
   renderer: CliRenderer
-  destroy(): void
+  destroy(): void          // tree + plugins; also the renderer if runQml created it
 }
 
-export function createQmlEngine(opts: QmlEngineOptions & { types?: ... }): QmlEngine  // registers builtins + OpenTUI types
+export function createQmlEngine(opts: QmlEngineOptions & { types?: ... }): QmlEngine
+  // builtins + OpenTUI types + Slot + Plugin/Contribution, then `types`
 export { parseQml } from "./parser"
-export { QmlObject, VisualObject, QmlEngine } ...
+export { QmlObject, VisualObject, QmlEngine, Slot, registerPlugin, ... } ...
 ```
 
+Startup order: parse the document (syntax errors throw `QmlSyntaxError` before any side effect),
+load plugins (so a QML plugin's `types` are visible to the document), instantiate, check the root
+is visual, mount into `renderer.root`, apply keymap overrides. On failure everything created so far
+is torn down (the renderer only if `runQml` created it) and the error is rethrown.
+
 Exiting: `Qt.quit()` or Escape handled by the user's QML → `renderer.destroy()`. Never call
-`process.exit()` from the runtime. `runQml` wires `renderer.on("destroy")` to `engine.destroy()`.
+`process.exit()` from the runtime. `runQml` wires `renderer.on("destroy")` to plugin disposal +
+`engine.destroy()`.
+
+CLI (`src/cli.ts`, bin `opentui-qml`): `opentui-qml <file.qml> [--plugins dir]... [--plugin file.qml]...
+[--context key=value]... [--keymap file.json]`. `--context` values are JSON-parsed when possible.
+Exit codes via `process.exitCode`: 0 ok, 1 load/runtime error or missing file, 2 usage error.
 
 ## Testing
 
@@ -394,38 +415,81 @@ OpenTUI ships a slot-based plugin system (`createCoreSlotRegistry`, `registerCor
 `SlotRenderable` in `@opentui/core`): a plugin is `{ id, order?, setup?, dispose?, slots: { [name]: (ctx, data) => Renderable } }`
 and a `SlotRenderable({ registry, name, data?, mode: "append"|"replace"|"single_winner", fallback? })`
 mounts every contribution for `name` at that point in the tree, re-resolving when the registry
-changes. We expose exactly this to QML:
+changes. We expose exactly this to QML. The API is a set of free functions taking the engine
+(not engine methods), so the engine stays independent of OpenTUI's plugin module:
 
-- The engine owns one `CoreSlotRegistry` (`engine.slots`), created lazily with the renderer and a
-  context `{ engine, root, ...userContext }`.
-- **`Slot`** visual type wraps `SlotRenderable`: `Slot { name: "sidebar"; mode: "append"; data: ({...}) }`.
-  Children declared inside the `Slot` are its fallback (shown when no plugin contributes).
-  `data` is reactive: setting it updates `slotRenderable.data` (which triggers re-render of contributions).
-- **TypeScript plugins**: `runQml(file, { plugins: [plugin, ...] })` or `engine.registerPlugin(plugin)`
-  where `plugin` is an OpenTUI `CorePlugin`. Slot renderers receive `(ctx, data)` and return a
-  Renderable; they may also return a **QmlObject** (we unwrap `.renderable`) or a **QML source string**
-  (we instantiate it with the slot `data` as context properties) — helper `engine.createFromSource(src, parent?, ctx?)`.
+```ts
+getSlotRegistry(engine): QmlSlotRegistry          // lazily created; shared per renderer (OpenTUI keys it by renderer)
+registerPlugin(engine, plugin: AnyPlugin): () => void   // returns the unregister function
+unregisterPlugin(engine, id): boolean
+listPlugins(engine): { id, order, kind: "ts" | "qml", file? }[]
+loadQmlPlugin(engine, path): Promise<PluginObject>      // rejects if the root is not a Plugin
+loadPluginsFromDir(engine, dir): Promise<PluginObject[]> // skips non-Plugin files; errors are reported
+registerPluginTypes(engine)                              // registers Plugin + Contribution (createQmlEngine does this)
+createFromSource(engine, source, parent?, contextProps?) // instantiate QML text (component cached per source)
+```
+
+- The registry context is `{ ...context, engine, renderer, root }` where `context` is the
+  `runQml` `context` option (engine globals) and `root` is the application root's proxy (set once
+  the document is instantiated; `null` during plugin `setup`).
+- **`Slot`** visual type wraps `SlotRenderable`: `Slot { name: "sidebar"; mode: "replace"; data: ({...}) }`.
+  Children declared inside the `Slot` are its fallback. Modes follow OpenTUI: **`replace`
+  (default)** shows all contributions, or the fallback when there are none; `append` always shows
+  the fallback followed by the contributions; `single_winner` shows only the first contribution.
+  Contributions are ordered by plugin `order`, then registration order. `data` is reactive
+  (assigning a new value re-renders the contributions; `refresh()` re-renders after an in-place
+  mutation). Read-only `count` = number of contributing plugins. Layout props for the contents
+  (`flexDirection`, `alignItems`, `justifyContent`, `padding*`, `gap`/`spacing`) apply to the
+  contributions; size/position/margin props apply to the Slot itself. Changing `name` re-resolves.
+- **TypeScript plugins**: `runQml(file, { plugins: [plugin, ...] })` or `registerPlugin(engine, plugin)`
+  where `plugin` is an OpenTUI `CorePlugin` (any `CorePlugin` is assignable to `QmlPluginSpec`).
+  Slot renderers receive `(ctx, data)` and return a Renderable; they may also return a visual
+  **QmlObject** or its proxy (we mount `.renderable`; the object is destroyed with it) or a **QML
+  source string** (instantiated with context properties `{ ...data, data, slotData }`).
+  Function contributions are host-owned (destroyed when unmounted); `{ render, onActivate?,
+  onDeactivate?, onDispose? }` contributions are plugin-owned (OpenTUI "managed": only detached).
 - **QML plugins**: a `.qml` file whose root is `Plugin`:
 
   ```qml
   import OpenTUI
   Plugin {
-      id: "wordcount"          // plugin id (string property, not a QML id)
+      pluginId: "wordcount"    // optional; defaults to the QML `id`, then the file's base name
       order: 10
+      types: ["./Widget.qml"]  // registered engine-wide under their base names (relative to this file)
       Contribution {
           slot: "statusbar"
-          Text { text: "words: " + data.words }      // `data` = the Slot's data; `plugin`, `engine` also in scope
+          Text { text: "words: " + data.words }   // `data` (alias `slotData`) = the Slot's data
       }
       Contribution { slot: "sidebar"; mode: "managed"; Item { ... } }
       Component.onCompleted: console.log("plugin loaded")   // = setup
       Component.onDestruction: ...                          // = dispose
   }
   ```
+  **Deviation from the first draft:** the plugin id is `pluginId`, not `id: "wordcount"` —
+  `id` must be an identifier in QML (`id: "x"` is a syntax error). `Plugin { id: wordcount }`
+  also works (the QML id is the fallback plugin id).
+
   Loaded with `runQml(file, { plugins: ["./plugins/wordcount.qml"] })`, `{ pluginDirs: ["./plugins"] }`
-  (every `*.qml` in the dir whose root is `Plugin`), or `engine.loadPlugin(path)`. Each
-  `Contribution`'s single child object is a delegate (uninstantiated `Component`) instantiated per
-  slot mount with context `{ data, plugin, slot }`; the instance is destroyed when the slot unmounts.
-  Plugins can also contribute **keymaps** (`Keymap {}` / `Shortcut {}` children of `Plugin` are
-  global) and **types** (`Plugin { types: ["./Widget.qml"] }` registers extra QML types).
-- `engine.unregisterPlugin(id)`, `engine.plugins` (list), `pluginError` signal on the root for
-  failures (also logged). Plugin failures never crash the host: `SlotRegistry` already isolates them.
+  (every `*.qml` in the dir whose root is `Plugin`; helper types in the same dir are skipped),
+  `loadQmlPlugin(engine, path)`, or the CLI's `--plugin` / `--plugins`. QML plugins are loaded
+  before the host document is instantiated. The `Plugin` registers itself when it completes and
+  unregisters when destroyed (`unregisterPlugin(engine, id)` destroys it). Other `Plugin`
+  properties: `description`, read-only `registered`; changing `order` re-sorts live.
+
+  Each `Contribution`'s single child object is a delegate (uninstantiated, like `Component`)
+  instantiated per mounted Slot with context properties `{ data, slotData, plugin, slot, context,
+  engine }` (`plugin` = the Plugin object, `slot` = the slot name, `context` = the registry context).
+  One instance is kept per Slot; when the Slot's data changes the same instance is reused and its
+  `data` updates in place (bindings re-evaluate; nothing is recreated). The delegate must be
+  visual. `mode: "host"` (default; `"append"` is an accepted alias) — the Slot owns the instance
+  and destroys it when it stops showing it; `mode: "managed"` — the plugin owns it and it survives
+  deactivation, destroyed when its Slot or the plugin goes away.
+
+  Other children of `Plugin` (`Timer`, `Keymap`, `Shortcut`, ...) are ordinary objects that live
+  as long as the plugin; `id`s declared in the plugin file are in scope inside delegates.
+- Supporting this needed one engine addition: `engine.registerDocumentType(name, component)` /
+  `getDocumentType(name)` — named types backed by a loaded QML document (used for `types`).
+- Failures never crash the host: setup/render/dispose errors are isolated by OpenTUI's registry
+  and reported via `engine.reportError` (context `plugin "id" (phase, slot "x")`); duplicate ids,
+  unreadable/broken plugin files and non-visual delegates are reported the same way. If the root
+  declares `signal pluginError(var error)` it also receives `{ pluginId, slot, phase, message, error }`.

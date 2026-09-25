@@ -6,7 +6,6 @@ Rectangle {
     id: card
     property string heading: "Card"
     property color accent: "#7aa2f7"
-    default property list<Item> content
 
     border.width: 1
     border.color: accent
