@@ -11,7 +11,8 @@
   },
   "exports": {
     ".": "./src/index.ts",
-    "./parser": "./src/parser/index.ts"
+    "./parser": "./src/parser/index.ts",
+    "./testing": "./src/testing.ts"
   },
   "scripts": {
     "test": "bun test",
@@ -22,6 +23,7 @@
   "license": "MIT",
   "dependencies": {
     "@opentui/core": "^0.5.12",
+    "@opentui/keymap": "0.5.12",
     "solid-js": "1.9.12"
   },
   "devDependencies": {

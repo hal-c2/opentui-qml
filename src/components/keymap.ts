@@ -1,37 +1,54 @@
 /**
- * Keyboard shortcuts declared in QML.
+ * Keyboard shortcuts declared in QML, on top of `@opentui/keymap` (one keymap per engine, see
+ * `keymap-host.ts`).
  *
  * ```qml
  * Shortcut { sequence: "ctrl+s"; onActivated: save() }          // or sequences: ["ctrl+s", "f2"]
  * Keymap {
  *     name: "main"
- *     bindings: ({ "ctrl+s": "save", "q": "quit", "?": { action: "help", description: "Help" } })
- *     KeyBinding { keys: "ctrl+r"; action: "reload"; description: "Reload the file" }
- *     Action { name: "save"; shortcut: "ctrl+s"; onTriggered: save() }
+ *     leader: "space"
+ *     bindings: ({ "ctrl+s": "save", "gg": "top", "<leader>q": { action: "quit", description: "Quit" } })
+ *     KeyBinding { keys: "ctrl+x ctrl+r"; action: "reload"; description: "Reload the file" }
+ *     Action { name: "save"; shortcut: "mod+s"; text: "Save"; onTriggered: save() }
  *     handlers: ({ save: () => save(), quit: () => Qt.quit() })
  *     onActivated: (action, event) => console.log(action)
  * }
  * ```
  *
- * All enabled Keymaps and Shortcuts share the engine's key dispatcher: they are checked in
- * `priority` order (higher first, default 0), then creation (document) order, before the focused
- * renderable and before `Keys.*` handlers. The first match runs, and the key is consumed
- * (`stopPropagation()` + `preventDefault()`) unless the handler sets `event.accepted = false`.
+ * Every `Shortcut`, `Keymap` and standalone `Action` registers one keymap layer. Layers are
+ * checked by `priority` (higher first, default 0), then document order (earlier first), before
+ * the focused renderable and before `Keys.*` handlers. The first binding whose handler accepts
+ * the key consumes it (`preventDefault()` + `stopPropagation()`); a handler that sets
+ * `event.accepted = false` rejects it and dispatch falls through to the next matching binding
+ * or layer, and then to the focused renderable and `Keys.onPressed`.
  *
- * While a text editor (TextInput / TextArea) has focus, plain printable keys and editing keys
- * (no ctrl / meta / super) are left to the editor: a `"q"` binding doesn't swallow typing.
+ * `context` ("window" default, "item", "application"): "item" layers are active only while
+ * focus is inside the enclosing visual item; "window" and "item" layers yield plain printable
+ * and editing keys (no ctrl / alt / super) to a focused TextInput / TextArea, so a `"q"`
+ * shortcut doesn't swallow typing. "application" layers always win.
  *
- * Key strings: `"ctrl+s"`, `"shift+tab"`, `"alt+enter"` (alt = meta = option), `"escape"` /
- * `"esc"`, `"return"` / `"enter"`, `"space"`, `"up"`, `"pageup"`, `"f5"`, single characters
- * `"q"`, `"?"`, `"+"`. Modifiers are case-insensitive; a lone uppercase letter means shift
- * (`"Q"` == `"shift+q"`, but `"Ctrl+S"` == `"ctrl+s"`). Shift is ignored when matching single symbols like `"?"`.
+ * Key strings: `"ctrl+s"`, `"shift+tab"`, `"alt+enter"` (alt = meta = option), `"mod+s"` (ctrl,
+ * cmd on macOS), `"escape"` / `"esc"`, `"return"` / `"enter"`, `"space"`, `"up"`, `"f5"`, single
+ * characters `"q"`, `"?"`, `"+"`; sequences `"gg"`, `"ctrl+x ctrl+s"`, `"<leader>s"`; and
+ * comma-separated alternatives `"ctrl+s, f2"`. Modifiers are case-insensitive; a lone uppercase
+ * letter means shift (`"Q"` == `"shift+q"`, but `"Ctrl+S"` == `"ctrl+s"`). Shift is ignored
+ * when matching single symbols like `"?"`.
  */
-import { EditBufferRenderable, type KeyEvent } from "@opentui/core"
+import type { KeyEvent, Renderable } from "@opentui/core"
+import type { CommandContext } from "@opentui/keymap"
 import { QmlObject, toQmlObject } from "../runtime/object.ts"
-import { untrack } from "../runtime/reactive.ts"
+import { createSignal, untrack } from "../runtime/reactive.ts"
 import type { QmlEngine } from "../runtime/engine.ts"
-import { isPrintableSequence, keyDispatcherFor, makeQmlKeyEvent, type QmlKeyEvent } from "./key-dispatcher.ts"
+import { makeQmlKeyEvent, type QmlKeyEvent } from "./key-dispatcher.ts"
 import { isVisual } from "./visual.ts"
+import {
+  LayerSlot,
+  keyboardHostFor,
+  toKeymapKeys,
+  type ActiveKeyInfo,
+  type KeyboardHost,
+  type QmlKeymapLayer,
+} from "./keymap-host.ts"
 
 // -----------------------------------------------------------------------------------------------
 // Key sequences
@@ -162,24 +179,13 @@ export function keyEventMatches(event: KeyLike, parsed: ParsedKeySequence): bool
   return true
 }
 
-function tryParse(engine: QmlEngine, where: string, keys: string): ParsedKeySequence | null {
-  try {
-    return parseKeySequence(keys)
-  } catch (err) {
-    engine.warn(`${where}: ${err instanceof Error ? err.message : String(err)}`)
-    return null
-  }
-}
+// -----------------------------------------------------------------------------------------------
+// Shared plumbing
 
-/** Keys that a focused text editor should get even when a shortcut matches. */
-function isEditingKey(event: KeyEvent): boolean {
-  if (event.ctrl || event.meta || event.option || event.super) return false
-  if (isPrintableSequence(event.sequence)) return true
-  return ["space", "backspace", "delete", "left", "right", "home", "end", "return", "linefeed"].includes(event.name)
-}
+type KeyContext = "window" | "item" | "application"
 
-function editorHasFocus(engine: QmlEngine): boolean {
-  return engine.renderer?.currentFocusedRenderable instanceof EditBufferRenderable
+function toContext(v: unknown): KeyContext {
+  return v === "item" || v === "application" ? v : "window"
 }
 
 /** Nearest visual ancestor (for `context: "item"`). */
@@ -188,58 +194,134 @@ function enclosingVisual(obj: QmlObject): QmlObject | null {
   return null
 }
 
+/** A key string or an array of key strings → list. */
+function keyList(v: unknown): string[] {
+  if (Array.isArray(v)) return v.filter((x) => x !== null && x !== undefined && x !== "").map(String)
+  return v === null || v === undefined || v === "" ? [] : [String(v)]
+}
+
+/** Keymap keys for a QML key string; warns and returns [] when it is invalid. */
+function keysOrWarn(obj: QmlObject, key: string): string[] {
+  try {
+    return toKeymapKeys(key)
+  } catch (err) {
+    obj.engine.warn(`${obj.describe()}: ${err instanceof Error ? err.message : String(err)}`)
+    return []
+  }
+}
+
+/** Only non-empty string fields (the metadata addon rejects empty `desc` / `title`). */
+function textFields(fields: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(fields)) {
+    if (typeof v === "string" && v.trim() !== "") out[k] = v
+  }
+  return out
+}
+
+/** The event handed to `onActivated` / `onTriggered`; `payload` is set for dispatched commands. */
+export interface QmlCommandEvent extends QmlKeyEvent {
+  payload?: unknown
+}
+
+function qmlEvent(host: KeyboardHost, event: KeyEvent | null | undefined, payload?: unknown): QmlCommandEvent {
+  const e = makeQmlKeyEvent(event ?? host.commandEvent(), true) as QmlCommandEvent
+  if (payload !== undefined) e.payload = payload
+  return e
+}
+
+type LayerCtx = CommandContext<Renderable, KeyEvent>
+
+/** Base of the types that own one keymap layer. */
+abstract class KeymapLayerObject extends QmlObject {
+  protected readonly host: KeyboardHost
+  protected readonly slot: LayerSlot
+  /** Document order among all layers of the engine (earlier wins ties). */
+  private readonly layerIndex: number
+  /** `qmlOwner` layer field: attributes graph layers / pending sequences to this object. */
+  readonly ownerId: string
+  private readonly completedSignal = createSignal(false)
+
+  constructor(engine: QmlEngine, typeName: string) {
+    super(engine, typeName)
+    this.host = keyboardHostFor(engine)
+    this.slot = new LayerSlot(this.host, this)
+    this.layerIndex = this.host.nextLayerIndex()
+    this.ownerId = `${typeName}#${this.layerIndex}`
+    this.onDestroy(() => this.slot.dispose())
+  }
+
+  protected override onCompleted(): void {
+    super.onCompleted()
+    this.completedSignal[1](true)
+  }
+
+  /** Reactive `isCompleted` (layers are registered once the object is complete). */
+  protected completed(): boolean {
+    return this.completedSignal[0]()
+  }
+
+  /** Priority (+ document order), enabled matcher, target and editor guard. */
+  protected baseLayer(priority: unknown, context: KeyContext, target: QmlObject | null): QmlKeymapLayer {
+    const layer: QmlKeymapLayer = {
+      priority: (Number(priority) || 0) + 0.5 / (this.layerIndex + 1),
+      enabled: () => !this.isDestroyed && !!this.peek("enabled"),
+      qmlYieldToEditor: context !== "application",
+      qmlOwner: this.ownerId,
+    }
+    const t = target ?? (context === "item" ? enclosingVisual(this) : null)
+    if (t && isVisual(t)) {
+      layer.target = t.renderable as Renderable
+      layer.targetMode = "focus-within"
+    }
+    return layer
+  }
+
+  /** `enabled` is read at dispatch time; changing it only needs to refresh help data. */
+  protected defineEnabled(): void {
+    this.defineProperty("enabled", { type: "bool", value: true, onChange: () => this.host.touch() })
+  }
+}
+
 // -----------------------------------------------------------------------------------------------
 // Shortcut
 
-export class Shortcut extends QmlObject {
-  private parsed: ParsedKeySequence[] = []
-
+/**
+ * `Shortcut { sequence: "ctrl+s"; onActivated: (event) => save() }`: one or more key sequences
+ * (`sequence`, `sequences`) that emit `activated(event)`. `event.accepted = false` falls through.
+ */
+export class Shortcut extends KeymapLayerObject {
   constructor(engine: QmlEngine, typeName: string) {
     super(engine, typeName)
     this.defineProperty("sequence", { type: "string" })
     this.defineProperty("sequences", { type: "var", value: [] })
-    this.defineProperty("enabled", { type: "bool", value: true })
-    this.defineProperty("context", { type: "string", value: "application" })
+    this.defineEnabled()
+    this.defineProperty("context", { type: "string", value: "window" })
     this.defineProperty("autoRepeat", { type: "bool", value: true })
-    this.defineProperty("priority", {
-      type: "int",
-      value: 0,
-      onChange: () => keyDispatcherFor(engine).sort(),
-    })
+    this.defineProperty("priority", { type: "int", value: 0 })
+    this.defineProperty("description", { type: "string" })
     this.defineSignal("activated", ["event"])
     this.defineSignal("activatedAmbiguously")
     this.watch(() => {
-      const seqs: string[] = []
-      const one = this.get("sequence") as string
-      if (one) seqs.push(one)
-      const many = this.get("sequences")
-      if (Array.isArray(many)) seqs.push(...many.map(String))
+      if (!this.completed()) return
+      const seqs = [...keyList(this.get("sequence")), ...keyList(this.get("sequences"))]
+      const context = toContext(this.get("context"))
+      const priority = this.get("priority")
+      const description = String(this.get("description") ?? "")
       untrack(() => {
-        this.parsed = seqs.map((k) => tryParse(engine, this.describe(), k)).filter((p) => p !== null)
+        const keys = seqs.flatMap((k) => keysOrWarn(this, k))
+        if (keys.length === 0) return this.slot.set(null)
+        const layer = this.baseLayer(priority, context, null)
+        const cmd = (ctx: LayerCtx): boolean => this.activate(ctx.event)
+        layer.bindings = keys.map((key) => ({ key, cmd, ...textFields({ desc: description }) }))
+        this.slot.set(layer)
       })
     })
-    const self = this
-    const unregister = keyDispatcherFor(engine).add({
-      get priority() {
-        return Number(self.peek("priority")) || 0
-      },
-      handle: (e) => this.handle(e),
-    })
-    this.onDestroy(unregister)
   }
 
-  private handle(event: KeyEvent): boolean {
-    if (!this.isCompleted || !this.peek("enabled")) return false
+  private activate(event: KeyEvent): boolean {
+    if (this.isDestroyed || !this.peek("enabled")) return false
     if (!this.peek("autoRepeat") && (event.eventType === "repeat" || event.repeated)) return false
-    if (!this.parsed.some((p) => keyEventMatches(event, p))) return false
-    if (editorHasFocus(this.engine) && isEditingKey(event)) return false
-    if (this.peek("context") === "item") {
-      const item = enclosingVisual(this)
-      if (item && isVisual(item)) {
-        const r = item.renderable
-        if (!r.focused && !r.hasFocusedDescendant) return false
-      }
-    }
     const qevent = makeQmlKeyEvent(event, true)
     this.emit("activated", qevent)
     return qevent.accepted
@@ -247,7 +329,7 @@ export class Shortcut extends QmlObject {
 }
 
 // -----------------------------------------------------------------------------------------------
-// Keymap / KeyBinding
+// KeyBinding / Action
 
 export class KeyBinding extends QmlObject {
   constructor(engine: QmlEngine, typeName: string) {
@@ -261,22 +343,77 @@ export class KeyBinding extends QmlObject {
 }
 
 /**
- * `Action { name: "save"; shortcut: "ctrl+s"; onTriggered: save() }` — a named action inside a
- * Keymap. `triggered(event)` fires whenever the Keymap activates `name`; `shortcut` (a key
- * string or an array) adds bindings for it. `trigger()` fires it programmatically.
+ * `Action { name: "save"; shortcut: "ctrl+s"; text: "Save"; onTriggered: save() }` — a named
+ * command. Inside a Keymap it is one of the Keymap's actions: `triggered(event)` fires whenever
+ * the Keymap activates `name`, and `shortcut` (a key string or an array) adds bindings for it.
+ * Outside a Keymap it registers its own layer with the command and its shortcut bindings.
+ * `trigger(payload?)` dispatches the command `name` (like `Keyboard.dispatch(name)`), falling
+ * back to emitting `triggered` directly when no active command handles it.
  */
-export class Action extends QmlObject {
+export class Action extends KeymapLayerObject {
   constructor(engine: QmlEngine, typeName: string) {
     super(engine, typeName)
     this.defineProperty("name", { type: "string" })
     this.defineProperty("text", { type: "string" })
     this.defineProperty("shortcut", { type: "var" })
     this.defineProperty("description", { type: "string" })
-    this.defineProperty("enabled", { type: "bool", value: true })
+    this.defineProperty("category", { type: "string" })
+    this.defineEnabled()
+    this.defineProperty("context", { type: "string", value: "window" })
+    this.defineProperty("priority", { type: "int", value: 0 })
     this.defineSignal("triggered", ["event"])
-    this.defineMethod("trigger", () => this.emit("triggered", null))
+    this.defineMethod("trigger", (payload?: unknown) => this.trigger(payload))
+    this.watch(() => {
+      if (!this.completed() || this.parent instanceof Keymap) return
+      const name = String(this.get("name") ?? "")
+      const shortcut = keyList(this.get("shortcut"))
+      const text = String(this.get("text") ?? "")
+      const description = String(this.get("description") ?? "")
+      const category = String(this.get("category") ?? "")
+      const context = toContext(this.get("context"))
+      const priority = this.get("priority")
+      untrack(() => {
+        const keys = shortcut.flatMap((k) => keysOrWarn(this, k))
+        if (!name && keys.length === 0) return this.slot.set(null)
+        const layer = this.baseLayer(priority, context, null)
+        if (name) {
+          layer.commands = [
+            {
+              name,
+              run: (ctx: LayerCtx) => this.fire(ctx.event, ctx.payload),
+              ...textFields({ title: text, desc: description || text, category }),
+            },
+          ]
+        }
+        const cmd = (ctx: LayerCtx): boolean => this.fire(ctx.event)
+        layer.bindings = keys.map((key) => ({ key, cmd, ...textFields({ qmlCommand: name, desc: description || text }) }))
+        this.slot.set(layer)
+      })
+    })
+  }
+
+  /** Emit `triggered` (if enabled); returns `event.accepted`. */
+  fire(event: KeyEvent | null, payload?: unknown): boolean {
+    if (this.isDestroyed || !this.peek("enabled")) return false
+    const qevent = qmlEvent(this.host, event, payload)
+    this.emit("triggered", qevent)
+    return qevent.accepted
+  }
+
+  /** Dispatch the command `name`; without an active command, emit `triggered` directly. */
+  trigger(payload?: unknown): boolean {
+    const name = String(this.peek("name") ?? "")
+    if (name && !this.host.isDestroyed) {
+      const result = this.host.dispatchCommand(name, payload)
+      if (result.ok) return true
+      if (result.reason === "rejected" || result.reason === "error") return false
+    }
+    return this.fire(null, payload)
   }
 }
+
+// -----------------------------------------------------------------------------------------------
+// Keymap
 
 export interface KeymapEntry {
   keys: string
@@ -285,8 +422,10 @@ export interface KeymapEntry {
 }
 
 interface CompiledEntry extends KeymapEntry {
-  parsed: ParsedKeySequence
+  normalized: string[]
 }
+
+type RawEntry = { keys: string; action: string | null; description: string }
 
 const keymapRegistry = new WeakMap<QmlEngine, Set<Keymap>>()
 const keymapOverrides = new WeakMap<QmlEngine, Record<string, unknown>>()
@@ -305,9 +444,9 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 /** Entries of a bindings object: `{ keys: "action" | { action, description } | null }`. */
-function bindingEntries(obj: unknown): Array<{ keys: string; action: string | null; description: string }> {
+function bindingEntries(obj: unknown): RawEntry[] {
   if (!obj || typeof obj !== "object") return []
-  const out: Array<{ keys: string; action: string | null; description: string }> = []
+  const out: RawEntry[] = []
   for (const [keys, value] of Object.entries(obj as Record<string, unknown>)) {
     if (value === null || value === undefined || value === false) {
       out.push({ keys, action: null, description: "" })
@@ -323,70 +462,122 @@ function bindingEntries(obj: unknown): Array<{ keys: string; action: string | nu
   return out
 }
 
-export class Keymap extends QmlObject {
+interface ActionMeta {
+  title: string
+  description: string
+  category: string
+}
+
+/**
+ * A named set of key bindings → action names. Each activation emits `activated(action, event)`,
+ * calls `handlers[action](event, action)` and emits `triggered(event)` on enabled `Action`
+ * children with that name. Every action is also a keymap command (`Keyboard.dispatch(action)`).
+ */
+export class Keymap extends KeymapLayerObject {
   private entries: CompiledEntry[] = []
   private overrides: Record<string, unknown> = {}
+  private readonly entriesRev = createSignal(0, { equals: false })
+  private leaderKey = ""
+  private releaseLeader: (() => void) | null = null
 
   constructor(engine: QmlEngine, typeName: string) {
     super(engine, typeName)
     this.defineProperty("name", { type: "string" })
     this.defineProperty("bindings", { type: "var", value: {} })
     this.defineProperty("handlers", { type: "var", value: {} })
-    this.defineProperty("enabled", { type: "bool", value: true })
-    this.defineProperty("priority", {
-      type: "int",
-      value: 0,
-      onChange: () => keyDispatcherFor(engine).sort(),
-    })
+    this.defineEnabled()
+    this.defineProperty("priority", { type: "int", value: 0 })
+    this.defineProperty("context", { type: "string", value: "window" })
+    /** A visual item: the keymap is active only while focus is inside it. */
+    this.defineProperty("target", { type: "var", value: null })
+    /** The key of the `<leader>` token (e.g. "space", "ctrl+x"). */
+    this.defineProperty("leader", { type: "string" })
+    this.defineProperty("pendingSequence", { type: "string", readonly: true, value: "" })
     this.defineProperty("overridesRevision", { type: "int", value: 0 })
     this.defineSignal("activated", ["action", "event"])
     this.defineMethod("describe", () => this.describeBindings())
-    this.defineMethod("keysFor", (action: string) =>
-      this.entries.filter((e) => e.action === action).map((e) => e.keys),
-    )
+    this.defineMethod("keysFor", (action: string) => {
+      this.entriesRev[0]()
+      return this.entries.filter((e) => e.action === action).map((e) => e.keys)
+    })
+    this.defineMethod("activeKeys", (): ActiveKeyInfo[] => this.host.activeKeys({ owner: this.ownerId }))
+    this.defineMethod("dispatch", (action: unknown, payload?: unknown) => {
+      if (this.isDestroyed || !this.peek("enabled")) return false
+      return this.invoke(String(action ?? ""), null, payload)
+    })
 
     this.watch(() => {
-      const list: Array<{ keys: string; action: string | null; description: string }> = []
-      list.push(...bindingEntries(this.get("bindings")))
+      if (!this.completed()) return
+      const list: RawEntry[] = [...bindingEntries(this.get("bindings"))]
+      const meta = new Map<string, ActionMeta>()
       for (const child of this.trackChildren()) {
         if (!(child instanceof KeyBinding) || !child.get("enabled")) continue
-        const keys = child.get("keys")
         const action = String(child.get("action") ?? "")
         const description = String(child.get("description") ?? "")
-        const keyList = Array.isArray(keys) ? keys.map(String) : keys ? [String(keys)] : []
-        for (const k of keyList) list.push({ keys: k, action, description })
+        for (const k of keyList(child.get("keys"))) list.push({ keys: k, action, description })
       }
       for (const child of this.trackChildren()) {
         if (!(child instanceof Action)) continue
-        const keys = child.get("shortcut")
         const action = String(child.get("name") ?? "")
-        const description = String(child.get("description") || child.get("text") || "")
-        const keyList = Array.isArray(keys) ? keys.map(String) : keys ? [String(keys)] : []
-        for (const k of keyList) list.push({ keys: k, action, description })
+        const text = String(child.get("text") ?? "")
+        const description = String(child.get("description") || text)
+        if (action && !meta.has(action)) {
+          meta.set(action, { title: text, description, category: String(child.get("category") ?? "") })
+        }
+        for (const k of keyList(child.get("shortcut"))) list.push({ keys: k, action, description })
       }
       this.get("overridesRevision")
       list.push(...bindingEntries(this.overrides))
-      untrack(() => this.compile(list))
+      const handlers = this.get("handlers")
+      const context = toContext(this.get("context"))
+      const target = toQmlObject(this.get("target"))
+      const leader = String(this.get("leader") ?? "")
+      const priority = this.get("priority")
+      untrack(() => {
+        this.setLeader(leader)
+        this.compile(list)
+        const names = new Set<string>(this.entries.map((e) => e.action))
+        for (const name of meta.keys()) names.add(name)
+        if (handlers && typeof handlers === "object") for (const name of Object.keys(handlers)) names.add(name)
+        names.delete("")
+        const layer = this.baseLayer(priority, context, target)
+        layer.commands = [...names].map((name) => {
+          const m = meta.get(name)
+          const desc = m?.description || this.entries.find((e) => e.action === name && e.description)?.description || ""
+          return {
+            name,
+            run: (ctx: LayerCtx) => this.invoke(name, ctx.event, ctx.payload),
+            ...textFields({ title: m?.title, desc, category: m?.category }),
+          }
+        })
+        // Bindings without a description share the first one given for the same action.
+        const described = new Map<string, string>()
+        for (const e of this.entries) if (e.description && !described.has(e.action)) described.set(e.action, e.description)
+        layer.bindings = this.entries.flatMap((e) => {
+          const cmd = (ctx: LayerCtx): boolean => this.invoke(e.action, ctx.event)
+          const desc = e.description || meta.get(e.action)?.description || described.get(e.action)
+          const fields = textFields({ qmlCommand: e.action, desc })
+          return e.normalized.map((key) => ({ key, cmd, ...fields }))
+        })
+        this.slot.set(layer)
+      })
     })
 
     keymapsOf(engine).add(this)
-    const self = this
-    const unregister = keyDispatcherFor(engine).add({
-      get priority() {
-        return Number(self.peek("priority")) || 0
-      },
-      handle: (e) => this.handle(e),
-    })
+    const offPending = this.host.onPendingChange(() =>
+      this.write("pendingSequence", this.host.ownsPending(this.ownerId) ? this.host.pendingSequence() : ""),
+    )
     this.onDestroy(() => {
-      unregister()
+      offPending()
       keymapsOf(engine).delete(this)
+      this.setLeader("")
     })
   }
 
   protected override onCompleted(): void {
-    super.onCompleted()
     const pending = keymapOverrides.get(this.engine)
     if (pending) this.applyOverrides(pending)
+    super.onCompleted()
   }
 
   /** Merge user overrides for this keymap (see `applyKeymapOverrides`). */
@@ -403,42 +594,63 @@ export class Keymap extends QmlObject {
     this.write("overridesRevision", (Number(this.peek("overridesRevision")) || 0) + 1)
   }
 
-  private compile(list: Array<{ keys: string; action: string | null; description: string }>): void {
+  private setLeader(leader: string): void {
+    if (leader === this.leaderKey) return
+    this.leaderKey = leader
+    this.releaseLeader?.()
+    this.releaseLeader = null
+    if (!leader) return
+    const key = keysOrWarn(this, leader)[0]
+    if (!key) return
+    this.host.mutate(() => {
+      if (this.leaderKey !== leader || this.isDestroyed) return
+      this.releaseLeader?.()
+      this.releaseLeader = this.host.setToken(this, "leader", key)
+    })
+  }
+
+  private compile(list: RawEntry[]): void {
     // Later entries override earlier ones for the same (normalised) key.
     const byKey = new Map<string, CompiledEntry | null>()
     for (const item of list) {
-      const parsed = tryParse(this.engine, this.describe(), item.keys)
-      if (!parsed) continue
-      const id = formatKeySequence(parsed)
+      const normalized = keysOrWarn(this, item.keys)
+      if (normalized.length === 0) continue
+      const id = normalized.join(",")
       byKey.delete(id)
-      byKey.set(id, item.action === null ? null : { keys: item.keys, action: item.action, description: item.description, parsed })
+      byKey.set(
+        id,
+        item.action === null ? null : { keys: item.keys, action: item.action, description: item.description, normalized },
+      )
     }
     this.entries = [...byKey.values()].filter((e): e is CompiledEntry => e !== null)
+    this.entriesRev[1](0)
   }
 
-  /** `[{ keys, action, description }]` for help screens. */
+  /** `[{ keys, action, description }]` for help screens (reactive). */
   describeBindings(): KeymapEntry[] {
+    this.entriesRev[0]()
     return this.entries.map(({ keys, action, description }) => ({ keys, action, description }))
   }
 
-  private handle(event: KeyEvent): boolean {
-    if (!this.isCompleted || !this.peek("enabled")) return false
-    const entry = this.entries.find((e) => keyEventMatches(event, e.parsed))
-    if (!entry) return false
-    if (editorHasFocus(this.engine) && isEditingKey(event)) return false
-    const qevent: QmlKeyEvent = makeQmlKeyEvent(event, true)
-    this.emit("activated", entry.action, qevent)
+  /**
+   * Run `action`: emit `activated(action, event)`, call the handler, trigger enabled `Action`
+   * children named `action`. Returns `event.accepted` (false rejects the key / command).
+   */
+  invoke(action: string, event: KeyEvent | null, payload?: unknown): boolean {
+    if (this.isDestroyed) return false
+    const qevent = qmlEvent(this.host, event, payload)
+    this.emit("activated", action, qevent)
     const handlers = this.peek("handlers") as Record<string, unknown> | null
-    const fn = handlers && typeof handlers === "object" ? handlers[entry.action] : undefined
+    const fn = handlers && typeof handlers === "object" ? handlers[action] : undefined
     if (typeof fn === "function") {
       try {
-        fn.call(this.proxy, qevent, entry.action)
+        fn.call(this.proxy, qevent, action)
       } catch (err) {
-        this.engine.reportError(err, `${this.describe()}: handler for "${entry.action}"`)
+        this.engine.reportError(err, `${this.describe()}: handler for "${action}"`)
       }
     }
     for (const child of this.children) {
-      if (child instanceof Action && child.peek("name") === entry.action && child.peek("enabled")) {
+      if (child instanceof Action && child.peek("name") === action && child.peek("enabled")) {
         child.emit("triggered", qevent)
       }
     }

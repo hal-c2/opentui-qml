@@ -183,8 +183,24 @@ export function createScope(chain: readonly ScopeLayerInput[], thisValue?: unkno
  * `globals` (engine globals: `Qt`, user context, type statics).
  */
 export function buildObjectScope(object: QmlObject, context: ComponentContext, globals: readonly ScopeLayer[]): QmlScope {
+  // Built-in list properties (`data`, `children`, `resources`) of the scope object yield to a
+  // same-named context property (delegates / plugin contributions inject `data`).
+  const contextHas = (name: string): boolean => {
+    if (object.contextProperties && name in object.contextProperties) return true
+    for (let c: ComponentContext | null = context; c; c = c.parent) {
+      if (c.contextProperties && name in c.contextProperties) return true
+    }
+    return false
+  }
+  const scopeObject: ScopeLayer = {
+    kind: "layer",
+    label: "scope object",
+    has: (name) => object.hasMember(name) && !(object.isIntrinsic(name) && contextHas(name)),
+    get: (name) => object.getMember(name),
+    set: (name, value) => object.setMember(name, value),
+  }
   const layers: ScopeLayer[] = [
-    objectLayer(object, "scope object"),
+    scopeObject,
     parentLayer(object),
     recordLayer(() => object.contextProperties, "object context"),
   ]

@@ -1,0 +1,12 @@
+# Demo bricks module
+module Demo.Bricks
+typeinfo plugins.qmltypes
+optional plugin demobricks
+designersupported
+depends QtQuick 2.15
+prefer :/Demo/Bricks/
+Card 1.0 Card.qml
+Card 2.0 Card2.qml
+singleton Theme 1.0 Theme.qml
+internal Helper Helper.qml
+Util 1.0 util.js

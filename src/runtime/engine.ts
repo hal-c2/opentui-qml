@@ -17,7 +17,7 @@
  * user's members after them, so user bindings win. Ids in Foo.qml are private to Foo.qml;
  * the user's ids live in the outer component.
  */
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, readFileSync, statSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
 import type { CliRenderer } from "@opentui/core"
@@ -32,8 +32,8 @@ import type {
   QmlDocument,
   ScriptBinding,
 } from "../parser/ast.ts"
-import { batch, untrack } from "./reactive.ts"
-import { compileFunction, compileScript, createHandler } from "./expression.ts"
+import { batch, runWithOwner, untrack } from "./reactive.ts"
+import { compileFunction, compileScript, createHandler, QmlRuntimeError } from "./expression.ts"
 import type { CompiledScript } from "./expression.ts"
 import { isHandlerName, QmlObject, toQmlObject } from "./object.ts"
 import { buildObjectScope, recordLayer } from "./scope.ts"
@@ -42,6 +42,7 @@ import { createQtGlobal } from "./qt.ts"
 import type { QtGlobal } from "./qt.ts"
 import { globalScheduler } from "./scheduler.ts"
 import { ComponentObject, registerBuiltins } from "./builtins.ts"
+import { evaluateScript, isModuleDirectory, QmlModule, uriToPath } from "./modules.ts"
 import type { ComponentContext, HandlerSpec, QmlTypeFactory, ResolvedType, Scheduler } from "./types.ts"
 
 export interface QmlEngineOptions {
@@ -64,7 +65,22 @@ export interface QmlEngineOptions {
   onWarning?: (message: string) => void
   /** Error sink for binding/handler errors. Default: `console.error("QML: ...")`. */
   onError?: (error: unknown, context?: string) => void
+  /**
+   * Directories searched for `import A.B.C` modules (as `<path>/A/B/C`), in order.
+   * Default: `[basePath ?? cwd]`. Relative entries resolve against `basePath` / cwd.
+   * See also {@link QmlEngine.addImportPath}.
+   */
+  importPaths?: string[]
 }
+
+/** A value (or lazy factory) registered with {@link QmlEngine.registerSingleton}. */
+interface RegisteredSingleton {
+  factory: ((engine: QmlEngine) => unknown) | null
+  value: unknown
+}
+
+/** Module uris provided by the engine itself (resolved against the type registry). */
+const NATIVE_MODULE = /^(OpenTUI|QtQuick|QtQml|Qt)(\.|$)/
 
 /** Options for {@link QmlEngine.instantiate}. */
 export interface InstantiateOptions {
@@ -95,6 +111,11 @@ interface Placement {
   contextRoot: boolean
   /** Don't queue completion (the caller will, e.g. for a document type's inner root). */
   deferCompletion: boolean
+  /**
+   * Append to `parent` directly instead of routing through its default property
+   * (`Component.createObject(parent)`, delegates, `engine.createObject(component, parent)`).
+   */
+  direct?: boolean
 }
 
 interface DefaultPropertyInfo {
@@ -112,6 +133,10 @@ export function createComponentContext(
 }
 
 const CHILD_LIST_PROPERTIES = new Set(["children", "data", "contentData", "contentChildren", "resources"])
+
+function isListType(type: string | undefined): boolean {
+  return type === "list" || (type?.startsWith("list<") ?? false)
+}
 
 export class QmlEngine {
   /** The OpenTUI renderer (see {@link QmlEngineOptions.renderer}). */
@@ -133,6 +158,18 @@ export class QmlEngine {
   private readonly defaultProps = new WeakMap<QmlObject, DefaultPropertyInfo>()
   private readonly roots = new Set<QmlObject>()
   private readonly globalLayers: ScopeLayer[]
+  private readonly importPathList: string[]
+  private readonly nativeModules = new Set<string>()
+  /** Module directories (one QmlModule per directory). */
+  private readonly modulesByDir = new Map<string, QmlModule>()
+  /** `uri \0 fromDir` → resolved module (null: not found). Cleared by `addImportPath`. */
+  private readonly moduleCache = new Map<string, QmlModule | null>()
+  /** Explicit `uri` → directory registrations (`registerModuleDirectory`), consulted first. */
+  private readonly moduleDirs = new Map<string, string>()
+  private readonly singletonInstances = new Map<QmlComponent, QmlObject>()
+  private readonly singletonsCreating = new Set<QmlComponent>()
+  private readonly registeredSingletons = new Map<string, RegisteredSingleton>()
+  private readonly scripts = new Map<string, Record<string, unknown>>()
   private readonly parse: (source: string, filename?: string) => QmlDocument
   private readonly onWarning?: (message: string) => void
   private readonly onError?: (error: unknown, context?: string) => void
@@ -153,8 +190,18 @@ export class QmlEngine {
       qsTranslate: (_ctx: unknown, s: unknown) => String(s),
       ...opts.globals,
     }
+    this.importPathList = (opts.importPaths ?? [opts.basePath ?? "."]).map((p) => resolve(opts.basePath ?? ".", p))
     const types = this.types
     this.globalLayers = [
+      {
+        kind: "layer",
+        label: "registered singletons",
+        has: (name) => this.registeredSingletons.has(name),
+        get: (name) => this.singletonValue(name),
+        set: (name) => {
+          throw new TypeError(`Cannot assign to singleton "${name}"`)
+        },
+      },
       recordLayer(() => this.globals, "globals"),
       {
         kind: "layer",
@@ -219,6 +266,182 @@ export class QmlEngine {
 
   typeNames(): string[] {
     return [...this.types.keys()]
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Singletons
+
+  /**
+   * Register a singleton visible by name in every document (after ids, context properties and
+   * document imports; before `globals`). `value` may be a QmlObject (its proxy is exposed), any
+   * JS value (e.g. a `createStore()` / `createPropertyMap()` object), or a factory function
+   * `(engine) => value` called once, on first use. Using the name as a type is an error.
+   */
+  registerSingleton(name: string, value: unknown): void {
+    const entry: RegisteredSingleton =
+      typeof value === "function" && !(value instanceof QmlObject)
+        ? { factory: value as (engine: QmlEngine) => unknown, value: undefined }
+        : { factory: null, value }
+    this.registeredSingletons.set(name, entry)
+  }
+
+  /** The value of a singleton registered with {@link registerSingleton} (undefined if none). */
+  singletonValue(name: string): unknown {
+    const entry = this.registeredSingletons.get(name)
+    if (!entry) return undefined
+    if (entry.factory) {
+      const factory = entry.factory
+      entry.factory = null
+      entry.value = untrack(() => runWithOwner(null, () => factory(this)))
+    }
+    return entry.value instanceof QmlObject ? entry.value.proxy : entry.value
+  }
+
+  hasSingleton(name: string): boolean {
+    return this.registeredSingletons.has(name)
+  }
+
+  /**
+   * The engine-wide instance of a singleton document (`pragma Singleton`, exported by a qmldir
+   * `singleton` line): created lazily on first use, once per engine, without a parent.
+   * Destroyed with the engine.
+   */
+  singletonFor(component: QmlComponent): QmlObject {
+    const existing = this.singletonInstances.get(component)
+    if (existing) return existing
+    if (this.singletonsCreating.has(component)) {
+      throw new QmlRuntimeError("singleton depends on itself during construction", component.filename)
+    }
+    this.singletonsCreating.add(component)
+    try {
+      const obj = runWithOwner(null, () => this.createObject(component, null)) as QmlObject
+      this.singletonInstances.set(component, obj)
+      return obj
+    } finally {
+      this.singletonsCreating.delete(component)
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Modules
+
+  /** Directories searched for `import A.B.C` (highest priority first). */
+  get importPaths(): string[] {
+    return [...this.importPathList]
+  }
+
+  /**
+   * Add a module search directory with the highest priority (like Qt's `addImportPath`).
+   * Relative paths resolve against `basePath` / cwd. Clears the module resolution cache
+   * (documents loaded before keep their resolved imports).
+   */
+  addImportPath(dir: string): void {
+    const abs = resolve(this.basePath ?? ".", dir)
+    const i = this.importPathList.indexOf(abs)
+    if (i >= 0) this.importPathList.splice(i, 1)
+    this.importPathList.unshift(abs)
+    this.moduleCache.clear()
+  }
+
+  /**
+   * Map a module uri to an explicit directory (which need not end in `A/B/C`). It takes
+   * precedence over the import paths. Relative paths resolve against `basePath` / cwd.
+   * Clears the module resolution cache.
+   */
+  registerModuleDirectory(uri: string, dir: string): void {
+    this.moduleDirs.set(uri, resolve(this.basePath ?? ".", dir))
+    this.moduleCache.clear()
+  }
+
+  /**
+   * Drop cached documents so the next load re-reads them from disk (hot reload). With `path`,
+   * only that file's document / JavaScript namespace (and, for a `qmldir`, its directory's
+   * module) are dropped; documents that already resolved it as a type keep the old one, so
+   * for a full reload call it without arguments: every cached document, module, qmldir and
+   * JavaScript namespace is dropped. The module resolution cache is always cleared.
+   *
+   * Objects already instantiated are untouched. Returns the instances of `pragma Singleton`
+   * documents that were dropped with their document; the caller destroys them once nothing
+   * uses them any more (else they live until the engine is destroyed).
+   */
+  invalidate(path?: string): QmlObject[] {
+    this.moduleCache.clear()
+    const stale: QmlObject[] = []
+    const dropSingleton = (component: QmlComponent): void => {
+      const obj = this.singletonInstances.get(component)
+      if (!obj) return
+      this.singletonInstances.delete(component)
+      stale.push(obj)
+    }
+    if (path === undefined) {
+      this.files.clear()
+      this.modulesByDir.clear()
+      this.scripts.clear()
+      for (const component of [...this.singletonInstances.keys()]) dropSingleton(component)
+      return stale
+    }
+    const abs = resolve(this.basePath ?? ".", path)
+    this.files.delete(abs)
+    this.scripts.delete(abs)
+    if (abs.endsWith("qmldir")) this.modulesByDir.delete(dirname(abs))
+    for (const component of [...this.singletonInstances.keys()]) if (component.filename === abs) dropSingleton(component)
+    return stale
+  }
+
+  /**
+   * Treat `uri` as a module provided by the engine's type registry (like `OpenTUI`, `QtQuick*`,
+   * `QtQml*`, `Qt.*`): importing it never touches the file system.
+   */
+  registerNativeModule(uri: string): void {
+    this.nativeModules.add(uri)
+  }
+
+  isNativeModule(uri: string): boolean {
+    return this.nativeModules.has(uri) || NATIVE_MODULE.test(uri)
+  }
+
+  /**
+   * Find the module directory for `uri`: a `registerModuleDirectory` entry, else
+   * `A.B.C` → `<importPath>/A/B/C` (first match wins), then `<fromDir>/A/B/C`. A directory is a module if it has a `qmldir` or `.qml` files.
+   * Returns null if not found. Cached per (uri, fromDir).
+   */
+  resolveModule(uri: string, fromDir?: string): QmlModule | null {
+    const key = `${uri}\0${fromDir ?? ""}`
+    const cached = this.moduleCache.get(key)
+    if (cached !== undefined) return cached
+    const rel = uriToPath(uri)
+    const candidates = this.importPathList.map((p) => join(p, rel))
+    const explicit = this.moduleDirs.get(uri)
+    if (explicit) candidates.unshift(explicit)
+    if (fromDir) candidates.push(join(fromDir, rel))
+    const dir = candidates.find(isModuleDirectory)
+    const module = dir ? this.moduleForDirectory(dir, uri) : null
+    this.moduleCache.set(key, module)
+    return module
+  }
+
+  /** The (cached) module for a directory, e.g. for `import "dir"` or a document's own directory. */
+  moduleForDirectory(dir: string, uri?: string): QmlModule {
+    const abs = resolve(dir)
+    let module = this.modulesByDir.get(abs)
+    if (!module) {
+      module = new QmlModule(abs, uri, (m) => this.warn(m))
+      this.modulesByDir.set(abs, module)
+    }
+    return module
+  }
+
+  /**
+   * The namespace object of a JavaScript resource (`import "lib.js" as Lib`, qmldir JS entries):
+   * evaluated once per engine, with `Qt`, `qsTr`, `qsTranslate` and the engine globals in scope.
+   */
+  scriptNamespace(absPath: string): Record<string, unknown> {
+    let ns = this.scripts.get(absPath)
+    if (!ns) {
+      ns = evaluateScript(absPath, this.globals)
+      this.scripts.set(absPath, ns)
+    }
+    return ns
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -290,11 +513,17 @@ export class QmlEngine {
         index: opts.index,
         contextRoot: true,
         deferCompletion: false,
+        direct: true,
       })
       if (opts.contextProperties) obj.contextProperties = opts.contextProperties
+      // `required property var modelData` / `required property int index` on a delegate root:
+      // initialise (bind) from the same-named context property, so updates flow. This must run
+      // before any binding job so that bindings never see the property unset.
+      state.jobs.unshift(() => this.bindRequiredFromContext(obj, ctx))
       const initial = opts.initialProperties
       if (initial) {
-        state.jobs.push(() => {
+        // Initial properties are assigned before bindings evaluate (as in Qt's createObject).
+        state.jobs.unshift(() => {
           for (const [key, value] of Object.entries(initial)) obj.set(key, value)
         })
       }
@@ -302,6 +531,23 @@ export class QmlEngine {
       if (!obj.parent) this.roots.add(obj)
       return obj
     })
+  }
+
+  /**
+   * Bind every still-unassigned `required` property of `obj` that has a same-named context
+   * property (object-level, then the component context chain) to that context property.
+   * The binding reads through getters, so role/`data` updates re-evaluate it.
+   */
+  private bindRequiredFromContext(obj: QmlObject, ctx: ComponentContext): void {
+    const names = obj.unassignedRequiredProperties()
+    if (names.length === 0) return
+    const records: Array<Record<string, unknown>> = []
+    if (obj.contextProperties) records.push(obj.contextProperties)
+    for (let c: ComponentContext | null = ctx; c; c = c.parent) if (c.contextProperties) records.push(c.contextProperties)
+    for (const name of names) {
+      const record = records.find((r) => name in r)
+      if (record) obj.bind(name, () => record[name])
+    }
   }
 
   /** Scope for scripts written on `object` in `context` (default: the object's own context). */
@@ -313,7 +559,8 @@ export class QmlEngine {
     }
     let scope = byContext.get(context)
     if (!scope) {
-      scope = buildObjectScope(object, context, this.globalLayers)
+      const imports = context.component?.importLayer
+      scope = buildObjectScope(object, context, imports ? [imports, ...this.globalLayers] : this.globalLayers)
       byContext.set(context, scope)
     }
     return scope
@@ -376,6 +623,9 @@ export class QmlEngine {
     if (!component) throw new Error("QML: cannot instantiate outside a component")
     const resolved = component.resolveType(def.name)
     let obj: QmlObject
+    if (resolved.kind === "singleton") {
+      throw new QmlRuntimeError(`"${def.name}" is a singleton and cannot be used as a type`, component.filename, def.loc?.start.line)
+    }
     if (resolved.kind === "document") {
       // A document used as a type: build its root in a fresh private context, then apply the
       // user's members on top (below).
@@ -385,7 +635,8 @@ export class QmlEngine {
       obj = new resolved.factory(this, resolved.name)
       obj.component = ctx
       if (place.contextRoot) ctx.root = obj
-      if (place.parent) this.placeChild(place.parent, obj, place.index)
+      if (place.parent && place.direct) place.parent.appendChild(obj, place.index)
+      else if (place.parent) this.placeChild(place.parent, obj, place.index)
     }
     if (place.contextRoot && !ctx.root) ctx.root = obj
 
@@ -439,17 +690,22 @@ export class QmlEngine {
 
     // 4. Child objects and object-valued properties
     const isComponent = obj instanceof ComponentObject
-    const componentDefault = this.nativeComponentDefault(obj)
+    const componentDefault = this.componentDefault(obj)
     for (const m of def.members) {
       if (m.type === "Object") {
         if (isComponent) continue
         if (componentDefault) {
-          // `Repeater { Text {} }`: the child is the delegate, not an instance.
+          // `Repeater { Text {} }` / `default property Component delegate`: the child is a
+          // Component (the delegate), not an instance.
+          const { target, prop } = componentDefault
           const value = this.isComponentType(ctx, m.name)
             ? this.build(m, ctx, state, { parent: null, contextRoot: false, deferCompletion: false })
             : this.makeComponentValue(obj, m, ctx)
-          obj.ownObject(value)
-          state.jobs.push(() => this.assign(obj, componentDefault, value.proxy))
+          target.ownObject(value)
+          state.jobs.push(() => {
+            if (isListType(target.propertyType(prop))) this.addToProperty(target, prop, value)
+            else this.assign(target, prop, value.proxy)
+          })
         } else {
           this.build(m, ctx, state, { parent: obj, contextRoot: false, deferCompletion: false })
         }
@@ -638,53 +894,60 @@ export class QmlEngine {
     obj.set(name, value)
   }
 
-  /** Put a child built from a child ObjectDefinition into its parent (honours `default property`). */
-  private placeChild(parent: QmlObject, child: QmlObject, index?: number): void {
-    const info = this.defaultProps.get(parent)
+  /**
+   * Where inline child objects written inside `obj` go (its `default property`):
+   * - no default property / a default alias to `x.data`, `x.children`, `x.resources` or to the
+   *   object `x` itself → `appendChild` on the owner (`obj` or `x`), in declaration order;
+   * - a default (alias to a) property of any other type → the property receives the object
+   *   (a `list`/`list<T>` collects them into a new array, anything else holds the single object);
+   *   the object is owned by the property's object and is NOT a child (like Qt).
+   */
+  private defaultRoute(obj: QmlObject): { kind: "children"; target: QmlObject } | { kind: "property"; target: QmlObject; prop: string } {
+    const info = this.defaultProps.get(obj)
     if (!info) {
-      const native = parent.defaultPropertyName
-      if (native && !CHILD_LIST_PROPERTIES.has(native) && parent.hasProperty(native)) {
-        this.addToProperty(parent, native, child)
-      } else {
-        parent.appendChild(child, index)
-      }
-      return
+      const native = obj.defaultPropertyName
+      if (native && !CHILD_LIST_PROPERTIES.has(native) && obj.hasProperty(native)) return { kind: "property", target: obj, prop: native }
+      return { kind: "children", target: obj }
     }
     const decl = info.decl
-    if (decl.propertyType === "alias" && decl.aliasTarget && decl.aliasTarget.length > 0) {
-      const [head, ...rest] = decl.aliasTarget
-      const target = this.lookupId(info.context, head!)
-      const prop = rest.join(".")
-      if (target && target !== parent && (prop === "" || CHILD_LIST_PROPERTIES.has(prop))) {
-        this.placeChild(target, child, index)
-        return
-      }
-      if (target && target.hasProperty(prop)) {
-        this.addToProperty(target, prop, child)
-        return
-      }
-      parent.appendChild(child, index)
-      return
+    if (decl.propertyType !== "alias") return { kind: "property", target: obj, prop: decl.name }
+    const [head, ...rest] = decl.aliasTarget ?? []
+    const target = head ? this.lookupId(info.context, head) : null
+    if (!target) {
+      this.warn(`${obj.describe()}: default property alias "${decl.name}" has no valid target`)
+      return { kind: "children", target: obj }
     }
-    this.addToProperty(parent, decl.name, child)
+    const prop = rest.join(".")
+    if (prop === "" || CHILD_LIST_PROPERTIES.has(prop)) return { kind: "children", target }
+    if (target.hasProperty(prop)) return { kind: "property", target, prop }
+    this.warn(`${obj.describe()}: default property alias "${decl.name}" refers to unknown property "${prop}"`)
+    return { kind: "children", target: obj }
+  }
+
+  /** Put a child built from a child ObjectDefinition into its parent (honours `default property`). */
+  private placeChild(parent: QmlObject, child: QmlObject, index?: number): void {
+    const route = this.defaultRoute(parent)
+    if (route.kind === "children") route.target.appendChild(child, route.target === parent ? index : undefined)
+    else this.addToProperty(route.target, route.prop, child)
   }
 
   private addToProperty(obj: QmlObject, prop: string, child: QmlObject): void {
     obj.ownObject(child)
     const type = obj.propertyType(prop) ?? "var"
     const current = obj.peek(prop)
-    if (type === "list" || type.startsWith("list<") || Array.isArray(current)) {
+    if (isListType(type) || Array.isArray(current)) {
       obj.write(prop, [...((current as unknown[] | undefined) ?? []), child.proxy])
     } else {
       obj.write(prop, child.proxy)
     }
   }
 
-  /** A native type's `defaultPropertyName` when it is Component-typed (Repeater, Loader). */
-  private nativeComponentDefault(obj: QmlObject): string | null {
-    if (this.defaultProps.has(obj)) return null
-    const name = obj.defaultPropertyName
-    return name && obj.propertyType(name) === "Component" ? name : null
+  /** The default property of `obj` when it is Component-typed (Repeater, Loader, `default property Component x`). */
+  private componentDefault(obj: QmlObject): { target: QmlObject; prop: string } | null {
+    const route = this.defaultRoute(obj)
+    if (route.kind !== "property") return null
+    const type = route.target.propertyType(route.prop)
+    return type === "Component" || type === "list<Component>" ? { target: route.target, prop: route.prop } : null
   }
 
   private lookupId(ctx: ComponentContext, name: string): QmlObject | null {
@@ -719,7 +982,19 @@ export class QmlEngine {
   }
 }
 
-type ImportTarget = { kind: "dir"; dir: string } | { kind: "module"; uri: string }
+/** One `import` of a document. */
+type ImportEntry =
+  | { kind: "native"; uri: string }
+  | { kind: "module"; module: QmlModule; version?: string }
+  | { kind: "script"; path: string }
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory()
+  } catch {
+    return false
+  }
+}
 
 /** A loaded document: resolves type names visible to it and instantiates it. */
 export class QmlComponent {
@@ -729,34 +1004,62 @@ export class QmlComponent {
   readonly filename: string | undefined
   /** Directory whose sibling `.qml` files are visible as types. */
   readonly directory: string | undefined
-  private readonly importDirs: string[] = []
-  private readonly qualifiers = new Map<string, ImportTarget>()
+  /** The document has `pragma Singleton`. */
+  readonly isSingleton: boolean
+  /** The document's own directory as a module (qmldir entries incl. internal ones, plus files). */
+  private readonly ownModule: QmlModule | undefined
+  private readonly imports: ImportEntry[] = []
+  private readonly qualifiers = new Map<string, ImportEntry[]>()
   private readonly typeCache = new Map<string, ResolvedType | null>()
+  private readonly namespaces = new Map<string, object>()
+  private layer: ScopeLayer | undefined
 
   constructor(engine: QmlEngine, document: QmlDocument, filename?: string) {
     this.engine = engine
     this.document = document
     this.filename = filename
     this.directory = filename ? dirname(filename) : engine.basePath ? resolve(engine.basePath) : undefined
+    this.isSingleton = document.pragmas.some((p) => p.name === "Singleton")
+    this.ownModule = this.directory && isDirectory(this.directory) ? engine.moduleForDirectory(this.directory) : undefined
     for (const imp of document.imports) {
+      const line = imp.loc?.start.line
+      let entry: ImportEntry
       if (imp.path !== undefined) {
+        const abs = resolve(this.directory ?? ".", imp.path)
         if (/\.m?js$/.test(imp.path)) {
-          engine.warn(`${filename ?? "<qml>"}: JavaScript imports are not supported ("${imp.path}")`)
-          continue
+          if (!imp.qualifier) throw new QmlRuntimeError(`JavaScript import "${imp.path}" needs a qualifier ("as Name")`, filename, line)
+          if (!existsSync(abs)) throw new QmlRuntimeError(`JavaScript file "${abs}" not found`, filename, line)
+          engine.scriptNamespace(abs)
+          entry = { kind: "script", path: abs }
+        } else {
+          if (!isDirectory(abs)) throw new QmlRuntimeError(`import "${imp.path}": directory "${abs}" not found`, filename, line)
+          entry = { kind: "module", module: engine.moduleForDirectory(abs), version: imp.version }
         }
-        const dir = resolve(this.directory ?? ".", imp.path)
-        if (imp.qualifier) this.qualifiers.set(imp.qualifier, { kind: "dir", dir })
-        else this.importDirs.push(dir)
-      } else if (imp.uri && imp.qualifier) {
-        this.qualifiers.set(imp.qualifier, { kind: "module", uri: imp.uri })
-      }
+      } else if (imp.uri) {
+        if (engine.isNativeModule(imp.uri)) {
+          entry = { kind: "native", uri: imp.uri }
+        } else {
+          const module = engine.resolveModule(imp.uri, this.directory)
+          if (!module) {
+            const paths = engine.importPaths.join(", ")
+            throw new QmlRuntimeError(`module "${imp.uri}" is not installed (import paths: ${paths || "none"})`, filename, line)
+          }
+          entry = { kind: "module", module, version: imp.version }
+        }
+      } else continue
+      if (imp.qualifier) {
+        const list = this.qualifiers.get(imp.qualifier) ?? []
+        list.push(entry)
+        this.qualifiers.set(imp.qualifier, list)
+      } else this.imports.push(entry)
     }
   }
 
   /**
    * Resolve a type name as written (`"Item"`, `"QtQuick.Item"`, `"Q.Foo"`). Unqualified names
-   * look in: the document's directory (sibling `Foo.qml`), `import "dir"` directories, then
-   * the engine registry. Throws for unknown types.
+   * look in: the document's own directory (its qmldir, then sibling `Foo.qml`), unqualified
+   * module / `import "dir"` imports in declaration order, then the engine registry.
+   * Qualified names (`Q.Foo`) look only in the imports with that qualifier. Throws for unknown types.
    */
   resolveType(name: string): ResolvedType {
     const resolved = this.tryResolveType(name)
@@ -771,16 +1074,33 @@ export class QmlComponent {
     if (dot > 0) {
       const qualifier = name.slice(0, dot)
       const rest = name.slice(dot + 1)
-      const target = this.qualifiers.get(qualifier)
-      if (target?.kind === "dir") result = this.fromDirectory(target.dir, rest)
+      const entries = this.qualifiers.get(qualifier)
+      if (entries) for (const entry of entries) result ??= this.fromImport(entry, rest)
       else result = this.fromRegistry(rest.slice(rest.lastIndexOf(".") + 1))
     } else {
-      if (this.directory) result = this.fromDirectory(this.directory, name)
-      for (const dir of this.importDirs) result ??= this.fromDirectory(dir, name)
+      if (this.ownModule) result = this.fromModule(this.ownModule, name, undefined, true)
+      for (const entry of this.imports) result ??= this.fromImport(entry, name)
       result ??= this.fromRegistry(name)
     }
     this.typeCache.set(name, result ?? null)
     return result
+  }
+
+  /**
+   * Scope layer for names provided by this document's imports: import qualifiers (`B.Theme`,
+   * `Lib.fn()`), singletons (`Theme.accent`) and qmldir JavaScript resources.
+   */
+  get importLayer(): ScopeLayer {
+    this.layer ??= {
+      kind: "layer",
+      label: "imports",
+      has: (name) => this.importValue(name).found,
+      get: (name) => this.importValue(name).value,
+      set: (name) => {
+        throw new TypeError(`Cannot assign to "${name}" (an import)`)
+      },
+    }
+    return this.layer
   }
 
   /** Instantiate this document. */
@@ -788,18 +1108,101 @@ export class QmlComponent {
     return this.engine.createObject(this, parent, contextProps)
   }
 
-  private fromDirectory(dir: string, name: string): ResolvedType | undefined {
+  private importValue(name: string): { found: boolean; value?: unknown } {
+    if (this.qualifiers.has(name)) return { found: true, value: this.namespace(name) }
+    if (!/^[A-Z]/.test(name)) return { found: false }
+    const type = this.tryResolveType(name)
+    if (type?.kind === "singleton") return { found: true, value: type.instance() }
+    if (type) return { found: false }
+    let script: string | undefined
+    if (this.ownModule) script = this.scriptIn(this.ownModule, name)
+    for (const entry of this.imports) if (entry.kind === "module") script ??= this.scriptIn(entry.module, name, entry.version)
+    return script ? { found: true, value: this.engine.scriptNamespace(script) } : { found: false }
+  }
+
+  /** Namespace object for an import qualifier (`import T3.Bricks as B` → `B`). */
+  private namespace(qualifier: string): object {
+    let ns = this.namespaces.get(qualifier)
+    if (ns) return ns
+    const entries = this.qualifiers.get(qualifier)!
+    const lookup = (key: string): { found: boolean; value?: unknown } => {
+      for (const entry of entries) {
+        if (entry.kind === "script") {
+          const script = this.engine.scriptNamespace(entry.path)
+          if (key in script) return { found: true, value: script[key] }
+          continue
+        }
+        const type = this.tryResolveType(`${qualifier}.${key}`)
+        if (type?.kind === "singleton") return { found: true, value: type.instance() }
+        if (type?.kind === "native" && type.factory.qmlStatics) return { found: true, value: type.factory.qmlStatics }
+        if (entry.kind === "module") {
+          const path = this.scriptIn(entry.module, key, entry.version)
+          if (path) return { found: true, value: this.engine.scriptNamespace(path) }
+        }
+      }
+      return { found: false }
+    }
+    ns = new Proxy(Object.create(null) as object, {
+      has: (_t, key) => typeof key === "string" && lookup(key).found,
+      get: (_t, key) => (typeof key === "string" ? lookup(key).value : undefined),
+      set: (_t, key) => {
+        throw new TypeError(`Cannot assign to ${qualifier}.${String(key)}`)
+      },
+    })
+    this.namespaces.set(qualifier, ns)
+    return ns
+  }
+
+  private scriptIn(module: QmlModule, name: string, version?: string): string | undefined {
+    const entry = module.entry(name, "js", version, this.filename)
+    return entry ? module.pathOf(entry) : undefined
+  }
+
+  private fromImport(entry: ImportEntry, name: string): ResolvedType | undefined {
+    switch (entry.kind) {
+      case "native":
+        return this.fromRegistry(name.slice(name.lastIndexOf(".") + 1))
+      case "module":
+        return this.fromModule(entry.module, name, entry.version, false)
+      case "script":
+        return undefined
+    }
+  }
+
+  /**
+   * A type exported by a module: its qmldir entry (highest version ≤ the imported one; internal
+   * entries only for documents inside the module), else — for the own directory or modules
+   * without qmldir — a plain `Name.qml` file.
+   */
+  private fromModule(module: QmlModule, name: string, version: string | undefined, own: boolean): ResolvedType | undefined {
     if (!/^[A-Z]/.test(name)) return undefined
-    const path = join(dir, `${name}.qml`)
-    if (path === this.filename) return undefined
+    // The own directory: sibling `Name.qml` first (so `Card2.qml` can use `Card`), then qmldir.
+    let path = own || !module.qmldir ? module.plainFile(name) : undefined
+    if (path === this.filename) path = undefined
+    const entry = path ? undefined : module.entry(name, "qml", version, this.filename)
+    if (entry) path = module.pathOf(entry)
+    if (!path || path === this.filename) return undefined
     const component = this.engine.componentForFile(path)
-    return component ? { kind: "document", name, component } : undefined
+    if (!component) {
+      if (entry) this.engine.warn(`${module.dir}/qmldir: file "${entry.file}" for type "${name}" not found`)
+      return undefined
+    }
+    if (component.isSingleton || module.isSingletonFile(path)) {
+      const engine = this.engine
+      return { kind: "singleton", name, component, instance: () => engine.singletonFor(component).proxy }
+    }
+    return { kind: "document", name, component }
   }
 
   private fromRegistry(name: string): ResolvedType | undefined {
     const factory = this.engine.getType(name)
     if (factory) return { kind: "native", name, factory }
     const doc = this.engine.getDocumentType(name)
-    return doc ? { kind: "document", name, component: doc } : undefined
+    if (doc) return { kind: "document", name, component: doc }
+    if (this.engine.hasSingleton(name)) {
+      const engine = this.engine
+      return { kind: "singleton", name, instance: () => engine.singletonValue(name) }
+    }
+    return undefined
   }
 }

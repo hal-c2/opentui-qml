@@ -17,23 +17,34 @@
  *   - size: `width` / `height` (number, `"50%"`, `"auto"`), read-only layout results
  *     `x`, `y` (relative to the parent renderable), `layoutWidth`, `layoutHeight`;
  *   - every OpenTUI layout prop as a passthrough (`flexGrow`, `padding`, `alignItems`, ...);
- *   - `visible`, `opacity`, `z` (zIndex), `enabled`, `focus`, `activeFocus`, `focusable`,
- *     `spacing` (gap);
- *   - mouse signals `mouseDown/mouseUp/mouseMove/mouseScroll(mouse)`;
+ *   - `implicitWidth` / `implicitHeight` (used when `width` / `height` are not set);
+ *   - `visible`, `display` ("flex" / "none"), `opacity`, `z` (zIndex), `enabled`, `focus`
+ *     (writable, Qt style), read-only `focused` / `activeFocus`, `focusable`, `spacing` (gap);
+ *   - mouse signals `mouseDown/Up/Move/Drag/DragEnd/Drop/Over/Out/Scroll(mouse)` and
+ *     `sizeChanged(width, height)`;
  *   - `anchors.fill` / `anchors.centerIn` / `anchors.margins` (best effort, flexbox based);
- *   - attached `Layout.*` and `Keys.*`;
+ *   - attached `Layout.*`, `Keys.*` (incl. `Keys.onPaste` / `Keys.onReleased`),
+ *     `Window.onPaste` and `Screen.on<Signal>` handlers;
  *   - methods `forceActiveFocus()` (and the proxy's built-in `destroy()`).
  *
  * Subclasses override `createRenderable()` and redeclare the field with
  * `declare readonly renderable: XRenderable` (never a plain field: with ESNext class fields a
  * redeclared field would be reset to undefined after `super()` returns).
  */
-import { BoxRenderable, type KeyEvent, type MouseEvent, type Renderable } from "@opentui/core"
+import {
+  BoxRenderable,
+  decodePasteBytes,
+  type KeyEvent,
+  type MouseEvent,
+  type PasteEvent,
+  type Renderable,
+} from "@opentui/core"
 import { QmlObject, toQmlObject } from "../runtime/object.ts"
 import { createHandler } from "../runtime/expression.ts"
 import type { QmlEngine } from "../runtime/engine.ts"
 import type { HandlerSpec, PropertyType } from "../runtime/types.ts"
 import { keyDispatcherFor, makeQmlKeyEvent, type KeyEventKind, type QmlKeyEvent } from "./key-dispatcher.ts"
+import { connectScreenHandler } from "./screen.ts"
 
 let nextId = 0
 export function nextRenderableId(typeName: string): string {
@@ -44,11 +55,15 @@ export function isVisual(obj: unknown): obj is VisualObject {
   return obj instanceof VisualObject
 }
 
-/** Number of visual siblings that precede `index` among `parent.children`. */
+/**
+ * Number of visual siblings that precede `index` among `parent.children` (only those whose
+ * renderable is mounted in the parent: a `Portal` mounts elsewhere).
+ */
 export function visualIndexFor(parent: QmlObject, index: number): number {
   let n = 0
   for (let i = 0; i < index && i < parent.children.length; i++) {
-    if (isVisual(parent.children[i])) n++
+    const c = parent.children[i]
+    if (isVisual(c) && c.mountsInParent) n++
   }
   return n
 }
@@ -80,11 +95,24 @@ export abstract class VisualObject extends QmlObject {
     return true
   }
 
+  /** False when the renderable is mounted somewhere else than the QML parent (`Portal`). */
+  get mountsInParent(): boolean {
+    return true
+  }
+
+  /**
+   * Remove a child renderable from `contentRenderable`. Overridden by types whose renderable
+   * refuses a plain `remove()` (LineNumbers' target).
+   */
+  detachChildRenderable(child: Renderable): void {
+    if (child.parent) child.parent.remove(child)
+  }
+
   private warnedChildren = false
 
   protected override onChildAdded(child: QmlObject, index: number): void {
     super.onChildAdded(child, index)
-    if (isVisual(child)) {
+    if (isVisual(child) && child.mountsInParent) {
       if (!this.acceptsVisualChildren) {
         if (!this.warnedChildren) {
           this.warnedChildren = true
@@ -102,7 +130,7 @@ export abstract class VisualObject extends QmlObject {
   protected override onChildRemoved(child: QmlObject, _index: number): void {
     super.onChildRemoved(child, _index)
     if (isVisual(child) && child.renderable.parent === this.contentRenderable) {
-      this.contentRenderable.remove(child.renderable)
+      this.detachChildRenderable(child.renderable)
     }
   }
 
@@ -111,7 +139,13 @@ export abstract class VisualObject extends QmlObject {
     super.destroy()
     const r = this.renderable
     if (r.isDestroyed) return
-    if (r.parent) r.parent.remove(r)
+    const p = this.parent
+    try {
+      if (isVisual(p) && r.parent && r.parent === p.contentRenderable) p.detachChildRenderable(r)
+      else if (r.parent) r.parent.remove(r)
+    } catch (err) {
+      this.engine.reportError(err, `${this.describe()}: destroy`)
+    }
     r.destroyRecursively()
   }
 }
@@ -292,6 +326,117 @@ function keysRegistryFor(engine: QmlEngine): KeysRegistry {
   return r
 }
 
+// -----------------------------------------------------------------------------------------------
+// Paste routing (`Keys.onPaste` / `Window.onPaste`)
+
+/** Event passed to `Keys.onPaste` / `Window.onPaste`. Set `accepted = true` to consume it. */
+export interface QmlPasteEvent {
+  type: "paste"
+  /** The pasted text (`decodePasteBytes`). */
+  text: string
+  bytes: Uint8Array
+  metadata?: unknown
+  accepted: boolean
+  original: PasteEvent
+}
+
+function makePasteEvent(e: PasteEvent): QmlPasteEvent {
+  let accepted = false
+  return {
+    type: "paste",
+    text: decodePasteBytes(e.bytes),
+    bytes: e.bytes,
+    metadata: e.metadata,
+    original: e,
+    get accepted() {
+      return accepted
+    },
+    set accepted(v: boolean) {
+      accepted = !!v
+      if (accepted) {
+        e.preventDefault()
+        e.stopPropagation()
+      }
+    },
+  }
+}
+
+type PasteHandler = { fn: (...args: unknown[]) => unknown; global: boolean }
+
+/**
+ * Per-engine paste routing, a global `keyInput` "paste" listener (it runs before the focused
+ * renderable's own paste handling). `Keys.onPaste` handlers see the paste like keys: focused item
+ * and its ancestors first, then root items; `Window.onPaste` handlers always see it afterwards
+ * (unless it was accepted). Accepting a paste stops the focused input from inserting it.
+ */
+class PasteRegistry {
+  private readonly items = new Map<Item, PasteHandler[]>()
+  private unsub: (() => void) | null = null
+
+  constructor(private readonly engine: QmlEngine) {}
+
+  add(item: Item, fn: PasteHandler["fn"], global: boolean): void {
+    const list = this.items.get(item) ?? []
+    list.push({ fn, global })
+    this.items.set(item, list)
+    const keyInput = this.engine.renderer?.keyInput
+    if (!this.unsub && keyInput) {
+      const h = (e: PasteEvent): void => this.handle(e)
+      keyInput.on("paste", h)
+      this.unsub = () => keyInput.off("paste", h)
+    }
+  }
+
+  remove(item: Item): void {
+    this.items.delete(item)
+    if (this.items.size === 0 && this.unsub) {
+      this.unsub()
+      this.unsub = null
+    }
+  }
+
+  private deliver(item: Item, event: QmlPasteEvent, global: boolean): boolean {
+    if (item.isDestroyed || !item.peek("enabled")) return false
+    for (const h of this.items.get(item) ?? []) {
+      if (h.global !== global) continue
+      try {
+        h.fn(event)
+      } catch (err) {
+        this.engine.reportError(err, `${item.describe()}: onPaste`)
+      }
+      if (event.accepted) return true
+    }
+    return false
+  }
+
+  private handle(e: PasteEvent): void {
+    if (e.defaultPrevented || e.propagationStopped) return
+    const event = makePasteEvent(e)
+    const visited = new Set<QmlObject>()
+    const focused = this.engine.renderer?.currentFocusedRenderable ?? null
+    for (let o: QmlObject | null = visualForRenderable(focused); o; o = o.parent) {
+      visited.add(o)
+      if (o instanceof Item && this.items.has(o) && this.deliver(o, event, false)) return
+    }
+    for (const item of [...this.items.keys()]) {
+      if (item.parent || visited.has(item)) continue
+      if (this.deliver(item, event, false)) return
+    }
+    for (const item of [...this.items.keys()]) if (this.deliver(item, event, true)) return
+  }
+}
+
+const pasteRegistries = new WeakMap<QmlEngine, PasteRegistry>()
+
+function pasteRegistryFor(engine: QmlEngine): PasteRegistry {
+  let r = pasteRegistries.get(engine)
+  if (!r) {
+    r = new PasteRegistry(engine)
+    pasteRegistries.set(engine, r)
+  }
+  return r
+}
+
 /** `Keys.onReturnPressed` & co: handler name → key test. */
 function specificKeyTest(handlerName: string): ((e: QmlKeyEvent) => boolean) | null {
   const m = /^on([A-Z][A-Za-z0-9]*)Pressed$/.exec(handlerName)
@@ -366,6 +511,19 @@ function makeMouseEvent(e: MouseEvent, r: Renderable): QmlMouseEvent {
   }
 }
 
+/** OpenTUI mouse event type → QML signal name. */
+const MOUSE_SIGNALS: Record<string, string> = {
+  down: "mouseDown",
+  up: "mouseUp",
+  move: "mouseMove",
+  drag: "mouseDrag",
+  "drag-end": "mouseDragEnd",
+  drop: "mouseDrop",
+  over: "mouseOver",
+  out: "mouseOut",
+  scroll: "mouseScroll",
+}
+
 // -----------------------------------------------------------------------------------------------
 // Item
 
@@ -419,11 +577,22 @@ export class Item extends VisualObject {
 
     // Size
     for (const name of ["width", "height"] as const) {
+      const implicit = name === "width" ? "implicitWidth" : "implicitHeight"
       this.defineProperty(name, {
         type: "var",
         coerce: coerceDimension,
         onChange: (v, old) => {
           if (this.anchorFillTarget()) return
+          const fallback = this.peek(implicit)
+          this.pushLayout(name, v ?? fallback, old ?? fallback)
+        },
+      })
+      // Qt's implicit size: the size used when no explicit width/height is set.
+      this.defineProperty(implicit, {
+        type: "var",
+        coerce: coerceDimension,
+        onChange: (v, old) => {
+          if (this.anchorFillTarget() || this.peek(name) !== undefined) return
           this.pushLayout(name, v, old)
         },
       })
@@ -448,7 +617,12 @@ export class Item extends VisualObject {
       },
     })
 
-    this.defineProperty("visible", { type: "bool", value: true, onChange: (v) => (r.visible = !!v) })
+    // `visible: false` and `display: "none"` both map to yoga display none (Renderable.visible).
+    const applyVisible = (): void => {
+      if (!r.isDestroyed) r.visible = !!this.peek("visible") && this.peek("display") !== "none"
+    }
+    this.defineProperty("visible", { type: "bool", value: true, onChange: applyVisible })
+    this.defineProperty("display", { type: "string", value: "flex", onChange: applyVisible })
     this.defineProperty("opacity", {
       type: "real",
       value: 1,
@@ -477,6 +651,8 @@ export class Item extends VisualObject {
         this.applyFocus(!!v)
       },
     })
+    // `focused` (OpenTUI name) and `activeFocus` (Qt name): read-only, true while focused.
+    this.defineProperty("focused", { type: "bool", readonly: true, value: false })
     this.defineProperty("activeFocus", { type: "bool", readonly: true, value: false })
     r.on("focused", () => this.syncFocus(true))
     r.on("blurred", () => this.syncFocus(false))
@@ -491,19 +667,17 @@ export class Item extends VisualObject {
       onChange: (v, old) => this.pushLayout("margin", v, old),
     })
 
-    // Mouse
-    for (const [signal, slot] of [
-      ["mouseDown", "onMouseDown"],
-      ["mouseUp", "onMouseUp"],
-      ["mouseMove", "onMouseMove"],
-      ["mouseDrag", "onMouseDrag"],
-      ["mouseScroll", "onMouseScroll"],
-    ] as const) {
-      this.defineSignal(signal, ["mouse"])
-      r[slot] = (e: MouseEvent) => {
-        if (!this.peek("enabled") || this.isDestroyed) return
-        this.emit(signal, makeMouseEvent(e, this.renderable))
-      }
+    // Mouse: one catch-all listener (`onMouse`), so renderables that install their own per-type
+    // handlers (Slider, ScrollBar, EmbeddedTerminal) keep working.
+    for (const signal of Object.values(MOUSE_SIGNALS)) this.defineSignal(signal, ["mouse"])
+    r.onMouse = (e: MouseEvent) => {
+      const signal = MOUSE_SIGNALS[e.type]
+      if (!signal || !this.peek("enabled") || this.isDestroyed) return
+      this.emit(signal, makeMouseEvent(e, this.renderable))
+    }
+    this.defineSignal("sizeChanged", ["width", "height"])
+    r.onSizeChange = () => {
+      if (!this.isDestroyed) this.emit("sizeChanged", r.width, r.height)
     }
 
     const tracker = layoutTrackerFor(engine)
@@ -615,6 +789,7 @@ export class Item extends VisualObject {
     this.syncingFocus = true
     try {
       this.write("focus", focused)
+      this.write("focused", focused)
       this.write("activeFocus", focused)
     } finally {
       this.syncingFocus = false
@@ -639,8 +814,8 @@ export class Item extends VisualObject {
       this.anchorsApplied = true
     } else if (this.anchorsApplied) {
       this.anchorsApplied = false
-      r.width = (this.peek("width") as never) ?? "auto"
-      r.height = (this.peek("height") as never) ?? "auto"
+      r.width = (this.peek("width") as never) ?? (this.peek("implicitWidth") as never) ?? "auto"
+      r.height = (this.peek("height") as never) ?? (this.peek("implicitHeight") as never) ?? "auto"
     }
     const centerIn = toQmlObject(this.peek("anchors.centerIn"))
     if (isVisual(centerIn)) {
@@ -711,6 +886,17 @@ export class Item extends VisualObject {
   }
 
   override attachHandler(attachedType: string, handlerName: string, spec: HandlerSpec): void {
+    if (attachedType === "Screen") {
+      if (!connectScreenHandler(this, handlerName, spec)) super.attachHandler(attachedType, handlerName, spec)
+      return
+    }
+    if (handlerName === "onPaste" && (attachedType === "Keys" || attachedType === "Window")) {
+      const fn = createHandler(spec.compiled, spec.scope, ["event"])
+      const registry = pasteRegistryFor(this.engine)
+      registry.add(this, fn, attachedType === "Window")
+      this.onDestroy(() => registry.remove(this))
+      return
+    }
     if (attachedType !== "Keys") return super.attachHandler(attachedType, handlerName, spec)
     const kind: KeyEventKind = handlerName === "onReleased" ? "keyrelease" : "keypress"
     if (handlerName !== "onPressed" && handlerName !== "onReleased" && !specificKeyTest(handlerName)) {

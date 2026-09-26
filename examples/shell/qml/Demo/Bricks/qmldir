@@ -1,0 +1,8 @@
+# The demo app's bricks: a user shell.qml composes these (`import Demo.Bricks`).
+module Demo.Bricks
+ShellWindow 1.0 ShellWindow.qml
+Sidebar 1.0 Sidebar.qml
+StatusBar 1.0 StatusBar.qml
+Card 1.0 Card.qml
+Composer 1.0 Composer.qml
+singleton Palette 1.0 Palette.qml

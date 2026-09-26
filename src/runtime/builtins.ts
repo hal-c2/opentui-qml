@@ -1,6 +1,6 @@
 /**
- * Non-visual builtin types: QtObject, Timer, Repeater, Connections, Component, Loader,
- * ListModel / ListElement.
+ * Non-visual builtin types: QtObject, Timer, Repeater, Instantiator, Connections, Component,
+ * Loader, ListModel / ListElement.
  */
 import type { ObjectDefinition } from "../parser/ast.ts"
 import { createSignal, untrack } from "./reactive.ts"
@@ -418,6 +418,81 @@ export class Repeater extends QmlObject {
 }
 
 // -------------------------------------------------------------------------------------------
+// Instantiator
+
+/**
+ * `Instantiator { model: 3 | [...] | listModel; delegate: QtObject {} }` — like Repeater, but
+ * the created objects are NOT inserted into the visual tree: they are children of the
+ * Instantiator (owned by it). Useful for non-visual objects per model entry, e.g.
+ * `Instantiator { model: root.keybindings; delegate: Shortcut { sequence: modelData.keys } }`.
+ *
+ * Properties: `model`, `delegate` (default), `active` (default true), `asynchronous` (ignored),
+ * read-only `count` and `object` (the first instance). Method `objectAt(i)`. Signals
+ * `objectAdded(index, object)` / `objectRemoved(index, object)`. Any change of model, delegate
+ * or `active` recreates all objects.
+ */
+export class Instantiator extends QmlObject {
+  private items: QmlObject[] = []
+
+  constructor(engine: QmlEngine, typeName: string) {
+    super(engine, typeName)
+    this.defineProperty("model", { type: "var", value: 1 })
+    this.defineProperty("delegate", { type: "Component", value: null })
+    this.defineProperty("active", { type: "bool", value: true })
+    this.defineProperty("asynchronous", { type: "bool", value: false })
+    this.defineProperty("count", { type: "int", readonly: true })
+    this.defineProperty("object", { type: "var", value: null, readonly: true })
+    this.defineSignal("objectAdded", ["index", "object"])
+    this.defineSignal("objectRemoved", ["index", "object"])
+    this.defineMethod("objectAt", (i: number) => (this.get("count"), this.items[i]?.proxy ?? null))
+    this.defaultPropertyName = "delegate"
+  }
+
+  /** Current instances (untracked). */
+  get instances(): readonly QmlObject[] {
+    return this.items
+  }
+
+  protected override onCompleted(): void {
+    this.watch(() => {
+      const active = this.get("active") as boolean
+      const entries = active ? resolveModel(this.get("model")) : []
+      const delegate = active ? toComponentObject(this.get("delegate")) : null
+      untrack(() => this.regenerate(entries, delegate))
+    })
+  }
+
+  private regenerate(entries: ModelEntry[], delegate: ComponentObject | null): void {
+    this.clearItems()
+    if (!delegate || this.isDestroyed) return
+    for (const entry of entries) {
+      const item = delegate.createInstance({ parent: this, contextProperties: delegateContext(entry) })
+      if (item) this.items.push(item)
+    }
+    this.write("count", this.items.length)
+    this.write("object", this.items[0]?.proxy ?? null)
+    this.items.forEach((item, i) => this.emit("objectAdded", i, item.proxy))
+  }
+
+  private clearItems(): void {
+    const old = this.items
+    if (old.length === 0) return
+    this.items = []
+    this.write("count", 0)
+    this.write("object", null)
+    old.forEach((item, i) => {
+      this.emit("objectRemoved", i, item.proxy)
+      item.destroy()
+    })
+  }
+
+  override destroy(): void {
+    this.clearItems()
+    super.destroy()
+  }
+}
+
+// -------------------------------------------------------------------------------------------
 // Loader
 
 /**
@@ -635,6 +710,7 @@ export function registerBuiltins(engine: QmlEngine): void {
   engine.registerType("Component", ComponentObject)
   engine.registerType("Timer", Timer)
   engine.registerType("Repeater", Repeater)
+  engine.registerType("Instantiator", Instantiator)
   engine.registerType("Connections", Connections)
   engine.registerType("ListModel", ListModel)
   engine.registerType("ListElement", ListElement)

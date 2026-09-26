@@ -832,3 +832,32 @@ describe("errors", () => {
     expect(syntaxError("Item { anchors { Item {} } }").message).toContain("not allowed inside grouped property 'anchors'")
   })
 })
+
+describe("sibling objects on one line", () => {
+  const objects = (members: Member[]) => members.filter((m): m is ObjectDefinition => m.type === "Object")
+
+  test("objects separated only by whitespace after `}`", () => {
+    const doc = parseQml(`Row { Text { text: "a" } Text { text: "b" } }`)
+    expect(objects(doc.root.members).map((o) => o.name)).toEqual(["Text", "Text"])
+  })
+
+  test("with ids, semicolons and following bindings", () => {
+    const doc = parseQml(`Row { Item { id: a } Item { id: b }; Item {} width: 3 }`)
+    expect(objects(doc.root.members).map((o) => o.id)).toEqual(["a", "b", undefined])
+    const width = doc.root.members.find((m): m is PropertyBinding => m.type === "PropertyBinding" && m.name.join(".") === "width")
+    expect(width).toBeDefined()
+  })
+
+  test("nested one-liners and object-valued bindings", () => {
+    const doc = parseQml(`Item { Row { Text {} Text {} } property Item x: Item {} Rectangle {} }`)
+    const [row, rect] = objects(doc.root.members)
+    expect(row!.name).toBe("Row")
+    expect(objects(row!.members).length).toBe(2)
+    expect(rect!.name).toBe("Rectangle")
+  })
+
+  test("bindings without separators are still rejected", () => {
+    expect(() => parseQml(`Item { width: 1 height: 2 }`)).toThrow(QmlSyntaxError)
+    expect(() => parseQml(`Item { Text {} width: 1 height: 2 }`)).toThrow(QmlSyntaxError)
+  })
+})

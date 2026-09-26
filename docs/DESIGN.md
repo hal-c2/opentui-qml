@@ -30,6 +30,8 @@ src/
     types.ts        # QmlType / QmlTypeDefinition / PropertySpec interfaces
     index.ts
   components/       # OpenTUI-backed visual types (Item, Rectangle, Text, TextInput, ...)
+    keymap.ts       # Shortcut / Action / KeyBinding / Keymap (QML surface)
+    keymap-host.ts  # one @opentui/keymap Keymap per engine + the Keyboard singleton
     index.ts        # registerOpenTuiTypes(engine)
   index.ts          # public API: runQml, createQmlApp, QmlEngine, parseQml, ...
   cli.ts            # `opentui-qml <file.qml>`
@@ -184,6 +186,7 @@ export interface QmlEngineOptions {
   renderer: CliRenderer            // from @opentui/core (or the test renderer)
   globals?: Record<string, unknown> // extra names visible in every scope (level 6)
   basePath?: string                 // for relative imports/files
+  importPaths?: string[]            // module search dirs for `import A.B.C` (default [basePath ?? cwd])
 }
 
 export class QmlEngine {
@@ -197,6 +200,16 @@ export class QmlEngine {
   /** Instantiate a component. parent may be undefined for the root. */
   createObject(component: QmlComponent, parent?: QmlObject, contextProps?: Record<string, unknown>): QmlObject
   destroy(): void
+  // modules and singletons (see "Modules and singletons")
+  readonly importPaths: string[]
+  addImportPath(dir: string): void          // highest priority; clears the module cache
+  registerNativeModule(uri: string): void   // uri resolved against the type registry
+  registerModuleDirectory(uri: string, dir: string): void  // explicit uri -> dir, before importPaths
+  invalidate(path?: string): QmlObject[]    // drop cached docs/modules/scripts; returns stale QML singletons
+  resolveModule(uri: string, fromDir?: string): QmlModule | null
+  registerSingleton(name: string, value: unknown): void  // value, QmlObject or (engine) => value
+  singletonFor(component: QmlComponent): QmlObject       // lazy, one per engine, no parent
+  scriptNamespace(absPath: string): Record<string, unknown>  // JS resource, evaluated once
 }
 
 export interface QmlComponent {
@@ -223,6 +236,86 @@ Instantiation of an `ObjectDefinition` (order matters for QML semantics):
 Type files: a document whose root is `Item { property int foo }` used as `Foo { foo: 3 }` from
 another file: instantiate the `Foo` document's root as the object, then apply the user's
 members onto it (user bindings override). Ids inside Foo.qml are private to Foo.qml.
+
+Completion order: `Component.onCompleted` runs after every binding of the whole instantiation is
+applied, children before parents, siblings (and object-valued properties) in declaration order.
+For `Foo { }` the Foo.qml root's handlers run before the user's `Component.onCompleted`.
+
+### `data`, `children`, `resources`
+
+Every `QmlObject` has three read-only list properties (reactive, with `dataChanged` /
+`childrenChanged` / `resourcesChanged`): `data` = all child objects in order, `children` = the
+visual children (for a non-visual object: all children), `resources` = the non-visual children.
+They cannot be assigned (`children = []` is a TypeError); `data: [a, b]` in QML *appends* `a`
+and `b` as children. A real property with the same name (e.g. `Slot.data`) shadows the
+intrinsic one, and so does a same-named context property (plugin contributions' `data`).
+
+### Default property routing
+
+Child objects written inside `Foo { ... }` go to Foo's default property:
+- no `default property` in the document: the native type's `defaultPropertyName` if it is a
+  real property (`Repeater.delegate`, `Loader.sourceComponent`), else `appendChild`;
+- `default property alias content: inner.data` / `inner.children` / `inner` (an object alias):
+  `inner.appendChild(child)` in declaration order (inner's own default routing is not applied).
+  The children keep the scope of the document that wrote them (outer ids stay visible);
+- `default property list<Item> items` / `list<QtObject>`: the objects are collected into the
+  (reactive) array and are *not* reparented; `Column { data: root.items }` places them;
+- a non-list default (`Component`, `var`, `QtObject`): receives the single object; for a
+  `Component`-typed default the child stays uninstantiated (it becomes a Component value);
+- children declared in the same object that declares the default property use the type's
+  default (so `Item { default property alias content: box.children; Item { id: box } }` works,
+  unlike Qt's self-parenting gotcha).
+`Component.createObject(parent)`, delegates and `engine.createObject(c, parent)` append to
+`parent` directly (no default routing).
+
+### Delegates and required properties
+
+Delegates (Repeater, ListView, Instantiator) get the context properties `index`, `modelData`,
+`model` and, for `ListModel` rows, one live getter per role. This holds for number, array and
+ListModel models. A `required property` that is still unassigned after the delegate's own
+bindings and has a same-named context property is *bound* to it (so ListModel updates flow) and
+does not warn. `Instantiator { model; delegate; active; asynchronous (ignored); count; object;
+objectAt(i); objectAdded(index, object); objectRemoved(index, object) }` creates its objects as
+its own (non-visual) children.
+
+## Modules and singletons (`src/runtime/modules.ts`, `src/runtime/store.ts`)
+
+Imports are resolved per document when it is loaded:
+- `import OpenTUI`, `QtQuick*`, `QtQml*`, `Qt.*` (and `engine.registerNativeModule(uri)`) are
+  native: names resolve against the type registry.
+- `import A.B.C [version] [as Q]` searches `<importPath>/A/B/C` for each engine import path
+  (option `importPaths`, default `[basePath ?? cwd]`; `addImportPath` prepends), then the
+  importing document's directory. A directory with a `qmldir`, or with any `.qml` file, is a
+  module. Unknown modules throw `QmlRuntimeError` at load, listing the import paths. Modules
+  are cached per directory and per (uri, importing directory).
+- `import "dir" [as Q]` is the same for a directory relative to the document (must exist).
+- `import "file.js" as Name`: evaluated once per engine as a library (`.pragma` / `.import`
+  lines ignored), with `Qt`, `qsTr`, `qsTranslate` and the engine globals in scope. Top-level
+  `function` / `var` / `let` / `const` / `class` names become live members of `Name`.
+
+`qmldir` subset: `module`, `Type [version] File.qml`, `singleton Type [version] File.qml`,
+`internal Type File.qml` (only visible to documents inside the module directory),
+`Name [version] file.js` (JS resource, available as `Name`), `#` comments. Ignored: `typeinfo`,
+`plugin`, `optional plugin`, `classname`, `prefer`, `depends`, `import`, `designersupported`,
+`linktarget`, `static`, `system`. With several versions of a type, the highest version not
+above the imported one wins (unversioned import: the highest). Without a qmldir, every
+`Name.qml` in the directory is exported.
+
+Unqualified type lookup: the document's own directory (sibling `Name.qml`, then its qmldir
+entries, internal ones included), unqualified imports in declaration order, then the registry.
+`Q.Name` looks only in the imports qualified `Q`; `Q.Theme`, `Q.Util` also work in scripts.
+
+Singletons: a qmldir `singleton` entry (or a `pragma Singleton` document) is not instantiable
+(`Theme {}` throws); the name evaluates to one engine-wide instance created lazily on first
+read, with no parent, destroyed with the engine. From TypeScript,
+`engine.registerSingleton("Shell", value | qmlObject | (engine) => value)` exposes a name in
+every document (after document imports, before `globals`). For TS-side reactive state:
+- `createStore(initial)`: a deep proxy with one signal per key (reads of missing keys, `in`,
+  and key enumeration are tracked; plain objects/arrays are wrapped lazily; array methods work);
+- `createPropertyMap()`: `set/insert`, `get/value`, `contains`, `clear`, `keys`, `toJSON`,
+  values also readable as properties; reading an unset key is tracked, so
+  `Shell.state.layout ? Shell.state.layout.sidebarCollapsed : false` updates on
+  `state.set("layout", {...})`.
 
 ## Type definitions (`src/runtime/types.ts`)
 
@@ -315,6 +408,8 @@ export interface RunQmlOptions {
   pluginDirs?: string[]                   // dirs whose *.qml files with a Plugin root are loaded (relative to cwd)
   keymap?: Record<string, unknown>        // overrides merged into the document's Keymaps
   basePath?: string                       // default: the file's directory (source: cwd)
+  importPaths?: string[]                  // extra module dirs (relative to cwd), searched before basePath
+  singletons?: Record<string, unknown>    // engine.registerSingleton for each entry
   scheduler?: Scheduler
   onWarning?: (message: string) => void
   onError?: (error: unknown, context?: string) => void
@@ -343,7 +438,8 @@ Exiting: `Qt.quit()` or Escape handled by the user's QML → `renderer.destroy()
 `engine.destroy()`.
 
 CLI (`src/cli.ts`, bin `opentui-qml`): `opentui-qml <file.qml> [--plugins dir]... [--plugin file.qml]...
-[--context key=value]... [--keymap file.json]`. `--context` values are JSON-parsed when possible.
+[--context key=value]... [--keymap file.json] [-I dir]...`. `-I`/`--import-path` adds module
+search directories. `--context` values are JSON-parsed when possible.
 Exit codes via `process.exitCode`: 0 ok, 1 load/runtime error or missing file, 2 usage error.
 
 ## Testing
@@ -356,58 +452,140 @@ Keyboard interaction via `mockInput.pressKey("ARROW_DOWN")` / `typeText`.
 
 ## Non-goals for v1
 
-States/Transitions/Behaviors/animations, anchors beyond `fill`/`centerIn`, `Loader` async, QML
-modules with `qmldir`, JS `.import`/`.js` library files (nice-to-have: `import "foo.js" as Foo`),
+States/Transitions/Behaviors/animations, anchors beyond `fill`/`centerIn`, `Loader` async,
+C++/native `qmldir` plugins, `.import` inside JS files, non-library (per-instance) JS files,
+module version checks beyond picking qmldir entries,
 `ListView` delegates rendering custom items (Select owns rendering), `MouseArea` (mouse handlers are on Item).
 
-## Keymap (`src/components/keymap.ts`)
+## Keymap (`src/components/keymap.ts`, `src/components/keymap-host.ts`)
 
-Goal: keyboard shortcuts are declared in QML (so users can re-bind them) and the host app can
-override them from TypeScript. Built on OpenTUI's key helpers from `@opentui/core`
-(`parseKeyBinding`-style string → `{ name, ctrl, shift, meta, super }`, `defaultKeyAliases`,
-`matchesKeyBinding`, `keyBindingToString`).
+Goal: declare keyboard shortcuts in QML so users can rebind them, and let the host app override
+them from TypeScript. The implementation is built on `@opentui/keymap` (pinned to the same
+version as `@opentui/core`).
 
-Key strings: `"ctrl+s"`, `"shift+tab"`, `"alt+enter"` (alt = meta), `"escape"`/`"esc"`,
-`"return"`/`"enter"`, `"space"`, `"up"`, `"pageup"`, `"f5"`, single chars `"q"`, `"?"`.
-Case-insensitive modifiers; `"Ctrl+S"` == `"ctrl+s"`. Export `parseKeySequence(str)` and
-`keyEventMatches(event, parsed)`.
+### Host (`keymap-host.ts`)
 
-Types:
+Each engine gets one `KeyboardHost`, created lazily by the first keymap type or the first use of
+`Keyboard`. It owns one `@opentui/keymap` `Keymap` over `createOpenTuiKeymapHost(renderer)`. The
+host is destroyed with the engine (`registerOpenTuiTypes` wraps `engine.destroy`) or with the
+renderer. A headless engine (no renderer) has no keymap: layers are no-ops, and `Action.trigger()`
+emits locally.
+
+Addons installed, in this order:
+- The default set: `registerDefaultKeys`, `registerEnabledFields` and `registerMetadataFields`,
+  the same as `createDefaultOpenTuiKeymap`.
+- `registerBindingOverrides`, `registerEmacsBindings` (`"ctrl+x ctrl+s"`), `registerModBindings`
+  (`mod` = ctrl, or super on macOS), `registerEscapeClearsPendingSequence` and
+  `registerBaseLayoutFallback`.
+- `registerDeadBindingWarnings` and `registerUnresolvedCommandWarnings`.
+
+The package's `"warning"` and `"error"` events go to `engine.warn` with the prefix `keymap:`.
+`registerCommaBindings` is **not** installed, because it rejects the literal `","` and
+`"ctrl+,"`. Instead, alternatives (`"ctrl+s, f2"`) are split on the QML side (`toKeymapKeys`).
+
+QML-specific pieces:
+- **Layer fields**: `qmlYieldToEditor` (`activeWhen`: the layer is inactive while a focused
+  `EditBufferRenderable` would take the key as text) and `qmlOwner` (the id of the QML object,
+  used for `Keymap.activeKeys()` and `Keymap.pendingSequence`).
+- **Binding field**: `qmlCommand`, the action name shown by `activeKeys()`.
+- **Event-match resolver**: a shifted single symbol also matches without shift (`"?"`), and
+  option also matches as meta.
+- **`key` / `key:after` intercepts**: these bracket each dispatch. Layer changes made by handlers
+  during a dispatch are queued (`host.mutate`) and applied after the key.
+
+`toKeymapKeys` normalises QML key strings to the package's syntax, doing things the package
+parser does not:
+- a canonical modifier order
+- a lone capital letter becomes shift (`"G"` → `"shift+g"`)
+- aliases such as `esc`, `enter` → `return`, `comma`, `plus`, `pgup`
+- plain runs become sequences (`"gg"` → `"g g"`)
+- `"<leader>"` tokens
+- an error for unknown modifiers
+
+### Types
 
 ```qml
-// Qt-compatible: fires when the key is pressed anywhere in the app (context "application")
-// or, with context "item", only while the enclosing Item has focus.
 Shortcut {
-    sequence: "ctrl+s"              // or sequences: ["ctrl+s", "f2"]
+    sequence: "ctrl+s"              // or sequences: ["ctrl+s", "f2"]; "gg", "ctrl+x ctrl+s", "<leader>s"
     enabled: true
-    context: "application"          // "application" | "item"   (default application)
+    context: "window"               // "window" (default) | "item" | "application"
+    priority: 0
     autoRepeat: true                // ignore "repeat" key events when false
-    onActivated: save()
+    description: "Save"             // shown by Keyboard.activeKeys()
+    onActivated: (event) => save()
 }
 
-// A named action table users can edit. Bindings are a JS object or KeyBinding children.
-Keymap {
-    id: keys
-    bindings: ({ "ctrl+s": "save", "q": "quit", "escape": "quit", "?": "help" })
-    KeyBinding { keys: "ctrl+r"; action: "reload"; description: "Reload the file" }
-    onActivated: (action, event) => { ... }     // fires for every matched action
-    onSave: ...                                 // NOT supported (actions are dynamic) — use onActivated or `handlers`
-    handlers: ({ save: () => save(), quit: () => Qt.quit() })   // optional per-action functions
+Action {                            // standalone, or a child of a Keymap (then it is that keymap's action)
+    name: "save"; text: "Save"; shortcut: "mod+s"; description: "Save the file"; category: "File"
     enabled: true
-    priority: 0                                 // higher priority keymaps see the key first
+    onTriggered: (event) => save()  // event.payload is set by trigger(payload) / dispatch(name, payload)
 }
+// action.trigger(payload?) === Keyboard.dispatch(action.name, payload)
+
+Keymap {
+    name: "main"                    // override target: runQml(file, { keymap: { main: {...} } })
+    bindings: ({ "ctrl+s": "save", "gg": "top", "?": { action: "help", description: "Help" } })
+    KeyBinding { keys: "ctrl+r"; action: "reload"; description: "Reload the file" }
+    Action { name: "save"; shortcut: "mod+s"; text: "Save" }
+    handlers: ({ save: (event) => save(), quit: () => Qt.quit() })
+    onActivated: (action, event) => { ... }     // fires for every matched action
+    leader: "space"                             // defines the <leader> token
+    enabled: true; priority: 0; context: "window"; target: null   // target: an Item for "item" context
+    // describe(), keysFor(action), activeKeys(), pendingSequence, dispatch(action, payload?)
+}
+
+// Singleton
+Keyboard.pendingSequence            // reactive: "g", "ctrl+x", ...
+Keyboard.activeKeys()               // [{ key, command, description }] reachable now (reactive;
+                                    // minus keys a focused TextInput would take as typing)
+Keyboard.commands()                 // [{ name, title, description, category, keys }]
+Keyboard.dispatch(name, payload?)   // run a command; false if none accepted it
+Keyboard.setData(key, value) / getData(key)
+Keyboard.formatKey("mod+s")         // "ctrl+s" (or "super+s" on macOS)
+Keyboard.clearPendingSequence()
 ```
 
-Semantics: on each `keypress`, active Keymaps/Shortcuts are checked in priority order (then
-document order); the first match runs its handler and calls `event.stopPropagation()` +
-`preventDefault()` unless the handler sets `event.accepted = false`. `Keymap.bindings` can be
-replaced at runtime (`keys.bindings = {...}`) and can be loaded from JSON:
-`runQml(file, { keymap: { "ctrl+s": "save" } })` merges into every `Keymap { id: ... }` whose
-`name` matches (`Keymap { name: "main" }` ↔ `keymap: { main: {...} }`; unnamed keymap ↔ top-level
-object). `Keymap.describe()` returns `[{ keys, action, description }]` for help screens.
-Component keybindings: `ListView`/`TabBar`/`TextInput`/`TextArea` expose a `keyBindings`
-property passed through to the renderable (`[{ name: "j", action: "move-down" }]`) and a
-`keyAliasMap` passthrough.
+### Semantics
+
+- **Layers and precedence**: each `Shortcut`, `Keymap` and standalone `Action` registers one
+  layer. Layers are ordered by `priority` (higher first), then by document order (earlier
+  first). This is done with a fractional priority bonus, because the package otherwise prefers
+  newer layers. All keymap layers see a key before the focused renderable and before `Keys.*`:
+  the package listens with `prependListener`, and `KeyDispatcher` skips stopped events. Root
+  `Keys.onPressed` therefore does not see a key a binding consumed.
+- **Fall-through**: a handler that sets `event.accepted = false` makes the binding's command
+  return `false`. The package then does not `preventDefault()`, and it tries the next matching
+  binding or layer, then the focused renderable, then `Keys.*`.
+- **Context**:
+  - `"window"` (the default; it was `"application"` before `@opentui/keymap`) and `"item"`
+    layers set `qmlYieldToEditor`. While a `TextInput`/`TextArea` has focus and no sequence is
+    pending, keys without ctrl/alt/super that edit text are left to the input: printable
+    characters, space, backspace, delete, left, right, home, end and return. `"ctrl+s"` still fires.
+    A window-level `Shortcut { sequence: "a" }` therefore does not steal typing.
+  - `"item"` layers target the enclosing visual item, or `Keymap.target`, with `targetMode:
+    "focus-within"`.
+  - `"application"` layers are always active.
+- **Commands**:
+  - Command names are global, as in the package. `Keyboard.dispatch(name)` runs the
+    highest-priority active layer's command of that name, and a rejection falls down the chain.
+  - Bindings use inline command functions, so two `Keymap`s that both bind `"save"` stay
+    independent. As a consequence, the package's `bindingOverrides` addon does not apply to QML
+    bindings. QML overrides are key-based (below).
+- **Overrides**: `applyKeymapOverrides(engine, overrides)` (used by `runQml({ keymap })` and the
+  CLI's `--keymap`) merges `{ "ctrl+s": "save" }` into unnamed keymaps, and `{ main: {...} }`
+  into `Keymap { name: "main" }`. A `null` action removes a binding. Keymaps created later
+  receive the stored overrides on completion.
+- **Reactivity**:
+  - `bindings`, `enabled`, `priority`, `context`, `target`, `leader` and `sequence(s)` can
+    change at runtime; the layer is re-registered.
+  - `Keyboard.activeKeys()`, `Keyboard.commands()` and `Keymap.describe()` depend on the
+    keymap's state, so bindings that use them update with focus, the pending sequence and layer
+    changes.
+- **Helpers kept for compatibility**: `parseKeySequence`, `formatKeySequence`, `keyEventMatches`
+  and `normalizeKeyName`. These are single-stroke matchers that are not used for dispatch.
+- **Component key bindings**: `ListView`/`TabBar`/`TextInput`/`TextArea` expose a `keyBindings`
+  property that is passed through to the renderable (`[{ name: "j", action: "move-down" }]`),
+  plus a `keyAliasMap` passthrough.
 
 ## Plugins (`src/runtime/plugins.ts`, `src/components/slot.ts`)
 

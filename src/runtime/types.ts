@@ -66,6 +66,11 @@ export type QmlTypeFactory = (new (engine: QmlEngine, typeName: string) => QmlOb
 export type ResolvedType =
   | { kind: "native"; name: string; factory: QmlTypeFactory }
   | { kind: "document"; name: string; component: QmlComponent }
+  /**
+   * A singleton (`singleton Name 1.0 Name.qml` in a qmldir, a `pragma Singleton` document, or
+   * `engine.registerSingleton`). Not instantiable; the name evaluates to `instance()`.
+   */
+  | { kind: "singleton"; name: string; component?: QmlComponent; instance: () => unknown }
 
 /**
  * One instantiation of a document (or of an inline `Component`/delegate).

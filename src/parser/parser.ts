@@ -170,6 +170,8 @@ class Parser {
   /**
    * Members must be separated by `;` or a newline. Consumes an optional `;` and
    * checks that whatever follows is on a new line (or closes the object).
+   * A member that ends with `}` (a child object, a grouped property, an object-valued
+   * binding or a block handler) needs no separator: `Text {} Text {}` is valid, like in Qt.
    */
   private endMember(): void {
     const tok = this.peek()
@@ -178,6 +180,8 @@ class Parser {
       return
     }
     if (this.isPunct(tok, "}") || tok.type === "eof" || tok.newlineBefore) return
+    const prev = this.prevToken()
+    if (prev && this.isPunct(prev, "}")) return
     this.error(`expected ';' or newline, found ${describe(tok)}`, tok)
   }
 

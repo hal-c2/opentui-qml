@@ -45,6 +45,7 @@ export type { InstantiateOptions, QmlEngineOptions } from "./engine.ts"
 export {
   ComponentObject,
   Connections,
+  Instantiator,
   ListElement,
   ListModel,
   Loader,
@@ -57,3 +58,15 @@ export {
   toComponentObject,
 } from "./builtins.ts"
 export type { ComponentInstanceOptions, ModelEntry } from "./builtins.ts"
+export {
+  QmlModule,
+  compareVersions,
+  evaluateScript,
+  isModuleDirectory,
+  parseQmldir,
+  topLevelDeclarations,
+  uriToPath,
+} from "./modules.ts"
+export type { Qmldir, QmldirEntry } from "./modules.ts"
+export { createPropertyMap, createStore, isStore, unwrapStore } from "./store.ts"
+export type { PropertyMap } from "./store.ts"

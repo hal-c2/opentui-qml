@@ -674,7 +674,7 @@ export function isPluginDocument(component: QmlComponent, seen = new Set<QmlComp
   if (seen.has(component)) return false
   seen.add(component)
   const resolved = component.tryResolveType(component.document.root.name)
-  if (!resolved) return false
+  if (!resolved || resolved.kind === "singleton") return false
   if (resolved.kind === "native") return factoryIsPlugin(resolved.factory)
   return isPluginDocument(resolved.component, seen)
 }

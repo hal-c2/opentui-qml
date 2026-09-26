@@ -1,19 +1,32 @@
 #!/usr/bin/env bun
 /**
  * opentui-qml <file.qml> [--plugins dir]... [--plugin file.qml]... [--context key=value]... [--keymap file.json]
+ *             [-I dir]...
+ * opentui-qml --shell <DefaultShell.qml> --app-id <id> [--config-dir dir] [--module Uri=dir]... [--no-watch]
  */
 import { existsSync, readFileSync, statSync } from "node:fs"
 import { resolve } from "node:path"
 import { QmlSyntaxError } from "./parser/ast.ts"
-import { runQml, type RunQmlOptions } from "./index.ts"
+import { runQml, runShell, type RunQmlOptions } from "./index.ts"
 
 const USAGE = `Usage: opentui-qml <file.qml> [options]
+       opentui-qml --shell <DefaultShell.qml> --app-id <id> [options]
 
 Options:
   --plugins <dir>        Load every QML plugin (root type Plugin) in <dir>. Repeatable.
   --plugin <file.qml>    Load a single QML plugin file. Repeatable.
   --context key=value    Expose \`key\` to QML (value parsed as JSON when possible). Repeatable.
   --keymap <file.json>   Merge key bindings into the app's Keymaps.
+  -I, --import-path <dir>
+                         Search <dir> for \`import A.B.C\` modules (as <dir>/A/B/C). Repeatable;
+                         the file's directory is always searched last.
+
+Shell host (a user shell.qml in the config directory replaces the root, see docs/SHELL.md):
+  --shell <file.qml>     Run <file.qml> as the default shell.
+  --app-id <id>          Config directory $XDG_CONFIG_HOME/<id>/shell (default id: opentui-qml).
+  --config-dir <dir>     Use <dir> as the config directory (its shell.qml, its qml/ modules).
+  --module Uri=dir       Register module Uri from <dir>. Repeatable.
+  --no-watch             Don't hot-reload on file changes.
   -h, --help             Show this help.
 `
 
@@ -23,6 +36,16 @@ interface CliArgs {
   plugins: string[]
   context: Record<string, unknown>
   keymapFile?: string
+  /** `-I` / `--import-path` directories (undefined when none were given). */
+  importPaths?: string[]
+  /** `--shell`: run this file as the default shell of a shell host. */
+  shell?: string
+  appId?: string
+  configDir?: string
+  /** `--module Uri=dir` entries. */
+  modules?: Record<string, string>
+  /** `--no-watch` (true) */
+  noWatch?: boolean
   help: boolean
 }
 
@@ -68,6 +91,29 @@ export function parseArgs(argv: string[]): CliArgs {
       case "--keymap":
         args.keymapFile = take()
         break
+      case "-I":
+      case "--import-path":
+        ;(args.importPaths ??= []).push(take())
+        break
+      case "--shell":
+        args.shell = take()
+        break
+      case "--app-id":
+        args.appId = take()
+        break
+      case "--config-dir":
+        args.configDir = take()
+        break
+      case "--module": {
+        const pair = take()
+        const at = pair.indexOf("=")
+        if (at <= 0 || at === pair.length - 1) throw new UsageError(`--module expects Uri=dir, got "${pair}"`)
+        ;(args.modules ??= {})[pair.slice(0, at)] = pair.slice(at + 1)
+        break
+      }
+      case "--no-watch":
+        args.noWatch = true
+        break
       default:
         if (arg.startsWith("-")) throw new UsageError(`unknown option "${arg}"`)
         if (args.file) throw new UsageError(`unexpected argument "${arg}"`)
@@ -103,13 +149,17 @@ async function main(argv: string[]): Promise<number> {
     process.stdout.write(USAGE)
     return 0
   }
-  if (!args.file) {
+  if (args.shell && args.file) {
+    process.stderr.write(`opentui-qml: pass either a file or --shell, not both\n\n${USAGE}`)
+    return 2
+  }
+  if (!args.file && !args.shell) {
     process.stderr.write(USAGE)
     return 2
   }
-  const file = resolve(args.file)
+  const file = resolve((args.file ?? args.shell)!)
   if (!existsSync(file) || !statSync(file).isFile()) {
-    process.stderr.write(`opentui-qml: file not found: ${args.file}\n`)
+    process.stderr.write(`opentui-qml: file not found: ${args.file ?? args.shell}\n`)
     return 1
   }
   for (const dir of args.pluginDirs) {
@@ -120,6 +170,7 @@ async function main(argv: string[]): Promise<number> {
     context: args.context,
     plugins: args.plugins,
     pluginDirs: args.pluginDirs.filter((d) => existsSync(d)),
+    importPaths: args.importPaths,
   }
   if (args.keymapFile) {
     try {
@@ -133,7 +184,16 @@ async function main(argv: string[]): Promise<number> {
   try {
     // runQml destroys the renderer it created if loading fails, so the terminal is restored
     // before we print.
-    await runQml(file, options)
+    if (args.shell) {
+      await runShell({
+        ...options,
+        appId: args.appId ?? "opentui-qml",
+        defaultShell: file,
+        configDir: args.configDir,
+        modules: args.modules,
+        watch: !args.noWatch,
+      })
+    } else await runQml(file, options)
     return 0
   } catch (err) {
     process.stderr.write(`opentui-qml: ${describeError(err)}\n`)

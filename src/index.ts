@@ -110,6 +110,16 @@ export interface RunQmlOptions {
   keymap?: Record<string, unknown>
   /** Base directory for relative paths in the document (default: the file's directory / cwd). */
   basePath?: string
+  /**
+   * Extra module directories for `import A.B.C` (relative to cwd), searched before `basePath`
+   * (which is always searched). See `QmlEngine.importPaths`.
+   */
+  importPaths?: string[]
+  /**
+   * Singletons visible by name in every document (`engine.registerSingleton`): QML objects,
+   * `createStore()` / `createPropertyMap()` stores, plain values or lazy `(engine) => value`.
+   */
+  singletons?: Record<string, unknown>
   scheduler?: Scheduler
   onWarning?: (message: string) => void
   onError?: (error: unknown, context?: string) => void
@@ -153,11 +163,13 @@ async function start(
       renderer,
       globals: options.context,
       basePath,
+      importPaths: [...(options.importPaths ?? []).map((p) => resolve(p)), basePath],
       types: options.types,
       scheduler: options.scheduler,
       onWarning: options.onWarning,
       onError: options.onError,
     })
+    for (const [name, value] of Object.entries(options.singletons ?? {})) engine.registerSingleton(name, value)
     // Parse first so syntax errors surface before any plugin side effects.
     const component = await load(engine)
 
@@ -208,3 +220,9 @@ async function start(
     },
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Shell host (a user `shell.qml` replaces the app's default root; see docs/SHELL.md)
+
+export { runShell, defaultShellConfigDir, describeShellError, SHELL_ERROR_OVERLAY_QML } from "./shell.ts"
+export type { RunShellOptions, ShellApp, ShellEvent, ShellErrorLocation } from "./shell.ts"

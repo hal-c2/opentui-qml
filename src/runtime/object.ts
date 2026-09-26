@@ -82,6 +82,23 @@ export interface SignalEmitter {
 
 const proxyTargets = new WeakMap<object, QmlObject>()
 
+/**
+ * Built-in list properties every object has (Qt puts them on Item; we put them on every object
+ * so QtObject-based "bricks" can use `default property alias content: inner.data` too):
+ * - `data`: all child objects (read: proxies; assigning a list appends the objects as children),
+ * - `children`: the visual children of a visual object (all children of a non-visual one),
+ * - `resources`: the non-visual children.
+ * They are computed from the child list (tracked) and are not stored in the property table, so
+ * `propertyNames()` / enumeration don't include them. A type that defines a real property with
+ * one of these names (e.g. `Slot.data`) shadows the built-in.
+ */
+export const INTRINSIC_LIST_PROPERTIES: ReadonlySet<string> = new Set(["data", "children", "resources"])
+
+/** Duck-typed visual check (VisualObject lives in src/components): has a renderable. */
+export function isVisualObject(obj: unknown): boolean {
+  return obj instanceof QmlObject && "renderable" in obj
+}
+
 /** Default value for a declared property type. */
 export function defaultValueFor(type: PropertyType): unknown {
   switch (type) {
@@ -238,6 +255,7 @@ export class QmlObject {
     // Attached `Component.onCompleted` / `Component.onDestruction` are internal signals.
     this.defineSignal("Component.completed")
     this.defineSignal("Component.destruction")
+    for (const name of INTRINSIC_LIST_PROPERTIES) this.defineSignal(`${name}Changed`)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -275,6 +293,7 @@ export class QmlObject {
     child.storeParent(() => this as QmlObject)
     this.storeChildrenVersion((v) => v + 1)
     untrack(() => this.onChildAdded(child, at))
+    this.emitChildListChanged(child)
   }
 
   /** Remove `child` from `children`, clear its parent and call `onChildRemoved`. */
@@ -286,6 +305,49 @@ export class QmlObject {
     child.storeParent(null)
     this.storeChildrenVersion((v) => v + 1)
     untrack(() => this.onChildRemoved(child, at))
+    if (!this._destroying) this.emitChildListChanged(child)
+  }
+
+  /** Emit `dataChanged` + `childrenChanged`/`resourcesChanged` (unless shadowed by real props). */
+  private emitChildListChanged(child: QmlObject): void {
+    const names = ["data"]
+    if (isVisualObject(child) || !isVisualObject(this)) names.push("children")
+    if (!isVisualObject(child)) names.push("resources")
+    for (const name of names) if (!this.props.has(name)) this.emit(`${name}Changed`)
+  }
+
+  /**
+   * Tracked value of a built-in list property (`data`, `children`, `resources`) as proxies.
+   * See {@link INTRINSIC_LIST_PROPERTIES}.
+   */
+  intrinsicList(name: string): unknown[] {
+    const all = this.trackChildren()
+    switch (name) {
+      case "children":
+        return (isVisualObject(this) ? all.filter(isVisualObject) : all).map((c) => c.proxy)
+      case "resources":
+        return all.filter((c) => !isVisualObject(c)).map((c) => c.proxy)
+      default:
+        return all.map((c) => c.proxy)
+    }
+  }
+
+  /** `data = [a, b]` / `data: [a, b]`: append the objects (proxies or raw) as children. */
+  private appendData(value: unknown): void {
+    const list = Array.isArray(value) ? value : value === null || value === undefined ? [] : [value]
+    for (const item of list) {
+      const obj = toQmlObject(item)
+      if (obj) {
+        if (obj._parent !== this) this.appendChild(obj)
+      } else {
+        this.engine.warn(`${this.describe()}: cannot append non-object value to "data"`)
+      }
+    }
+  }
+
+  /** True if `name` is a built-in list property not shadowed by a real property. */
+  isIntrinsic(name: string): boolean {
+    return INTRINSIC_LIST_PROPERTIES.has(name) && !this.props.has(name)
   }
 
   /** Objects owned but not children (object-valued properties); destroyed with this object. */
@@ -297,19 +359,19 @@ export class QmlObject {
   // Properties
 
   hasProperty(name: string): boolean {
-    return this.props.has(name)
+    return this.props.has(name) || INTRINSIC_LIST_PROPERTIES.has(name)
   }
 
   /** Declared type of a property (`undefined` if unknown). Aliases report the target's type. */
   propertyType(name: string): PropertyType | undefined {
     const slot = this.props.get(name)
-    if (!slot) return undefined
+    if (!slot) return INTRINSIC_LIST_PROPERTIES.has(name) ? "list" : undefined
     return slot.alias ? slot.alias.target.propertyType(slot.alias.prop) : slot.type
   }
 
   isReadonly(name: string): boolean {
     const slot = this.props.get(name)
-    if (!slot) return false
+    if (!slot) return name === "children" || name === "resources"
     return slot.alias ? slot.alias.target.isReadonly(slot.alias.prop) : slot.readonly
   }
 
@@ -390,7 +452,7 @@ export class QmlObject {
   /** Tracked read. Unknown properties read as `undefined`. */
   get(name: string): unknown {
     const slot = this.props.get(name)
-    if (!slot) return undefined
+    if (!slot) return INTRINSIC_LIST_PROPERTIES.has(name) ? this.intrinsicList(name) : undefined
     if (slot.alias) return slot.alias.target.get(slot.alias.prop)
     return slot.read()
   }
@@ -411,6 +473,11 @@ export class QmlObject {
       this.bind(name, value.fn)
       return
     }
+    if (this.isIntrinsic(name)) {
+      if (name !== "data") throw new TypeError(`Cannot assign to read-only property "${name}"`)
+      this.appendData(value)
+      return
+    }
     const slot = this.ensureSlot(name)
     if (slot.alias) {
       slot.alias.target.set(slot.alias.prop, value)
@@ -427,6 +494,10 @@ export class QmlObject {
    * Use for read-only outputs (`count`, layout results) and C++-setter-like updates.
    */
   write(name: string, value: unknown): void {
+    if (this.isIntrinsic(name)) {
+      this.appendData(value)
+      return
+    }
     let slot = this.props.get(name)
     if (!slot) {
       this.defineProperty(name)
@@ -447,6 +518,19 @@ export class QmlObject {
    * Bindings bypass `readonly` (used for declaration initialisers).
    */
   bind(name: string, source: BindingSource, scope?: QmlScope | QmlObject): void {
+    if (this.isIntrinsic(name)) {
+      if (name !== "data") {
+        this.engine.reportError(new TypeError(`Cannot assign to read-only property "${name}"`), this.describe())
+        return
+      }
+      // `data: [a, b]`: evaluate (reactively) and append whatever the list holds.
+      const sc = typeof source === "function" ? null : this.resolveScope(scope)
+      this.watch(() => {
+        const value = typeof source === "function" ? source.call(this.proxy) : source.evaluate(sc!)
+        untrack(() => this.appendData(value))
+      })
+      return
+    }
     const slot = this.ensureSlot(name)
     if (slot.alias) {
       const resolved = typeof source === "function" ? scope : this.resolveScope(scope)
@@ -699,6 +783,13 @@ export class QmlObject {
     this.emit("Component.completed")
   }
 
+  /** Names of `required` properties that have not been assigned or bound yet. */
+  unassignedRequiredProperties(): string[] {
+    const out: string[] = []
+    for (const slot of this.props.values()) if (slot.required && !slot.assigned && !slot.alias) out.push(slot.name)
+    return out
+  }
+
   /**
    * Run `fn` reactively in this object's owner: it re-runs when anything it reads changes and
    * is disposed on `destroy()`. Errors are logged. Returns a disposer.
@@ -786,12 +877,19 @@ export class QmlObject {
 
   /** Is `name` a property, method, signal or property group of this object? */
   hasMember(name: string): boolean {
-    return this.props.has(name) || this.methods.has(name) || this.signals.has(name) || this.groups.has(name)
+    return (
+      this.props.has(name) ||
+      this.methods.has(name) ||
+      this.signals.has(name) ||
+      this.groups.has(name) ||
+      INTRINSIC_LIST_PROPERTIES.has(name)
+    )
   }
 
   /** JS-facing member value: tracked property read, bound method, signal emitter or group proxy. */
   getMember(name: string): unknown {
     if (this.props.has(name)) return this.get(name)
+    if (INTRINSIC_LIST_PROPERTIES.has(name)) return this.intrinsicList(name)
     if (this.methods.has(name)) return this.boundMethod(name)
     if (this.signals.has(name)) return this.signalEmitter(name)
     if (this.groups.has(name)) return this.groupProxy(name)
@@ -953,8 +1051,6 @@ export class QmlObject {
             return self
           case "parent":
             return self.trackParent()?.proxy ?? null
-          case "children":
-            return self.trackChildren().map((c) => c.proxy)
         }
         if (self.hasMember(key)) return self.getMember(key)
         switch (key) {
@@ -977,7 +1073,7 @@ export class QmlObject {
         return true
       },
       has(_t, key) {
-        return typeof key === "string" && (key === "parent" || key === "children" || self.hasMember(key))
+        return typeof key === "string" && (key === "parent" || self.hasMember(key))
       },
       ownKeys() {
         return self.memberKeysUnder("").filter((k) => self.props.has(k) || self.groups.has(k))

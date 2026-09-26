@@ -363,6 +363,10 @@ describe("examples", () => {
     ["dashboard.qml", ["opentui-qml dashboard", "Overview", "Welcome to the dashboard."]],
     ["todo.qml", ["Todos (3)", "[x] 1. Write a QML file", "[ ] 2. Run it with opentui-qml", "Add:"]],
     ["components.qml", ["Left", "Content of the left card", "and reused with different properties."]],
+    ["richtext.qml", ["Rich text", "Styles: bold italic underline strike dim", "Nested: green and bold and italic", "0 presses of space", "Links: opentui.com"]],
+    ["table.qml", ["Services (3 of 5)", "Service", "Latency (ms)", "cache", "degraded", "Rows:"]],
+    ["animation.qml", ["Animations", "] 0%", "running"]],
+    ["responsive.qml", ["Terminal: 80x24 (wide layout)", "Sidebar", "Side by side", "Resized 0 times"]],
   ]
   for (const [file, expected] of cases) {
     test(`${file} renders`, async () => {

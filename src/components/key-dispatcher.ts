@@ -1,10 +1,12 @@
 /**
- * Per-engine keyboard dispatch shared by `Keys.*` attached handlers, `Shortcut` and `Keymap`.
+ * Per-engine keyboard dispatch for `Keys.*` attached handlers. (`Shortcut` / `Action` / `Keymap`
+ * run on `@opentui/keymap`, see `keymap-host.ts`; its listener is prepended, so keymap bindings
+ * see a key first and a consumed key never reaches this dispatcher.)
  *
  * One listener is installed (lazily) on `renderer.keyInput` for "keypress" (and one for
- * "keyrelease" when needed). Global keyInput listeners run before OpenTUI's focused-renderable
- * handlers, so an entry that consumes a key (`stopPropagation()` + `preventDefault()`) keeps it
- * away from the focused TextInput / ListView.
+ * "keyrelease" when needed). Events whose propagation was stopped are skipped. Global keyInput
+ * listeners run before OpenTUI's focused-renderable handlers, so an entry that consumes a key
+ * (`stopPropagation()` + `preventDefault()`) keeps it away from the focused TextInput / ListView.
  *
  * Entries are ordered by `priority` (higher first), then by registration order. The first entry
  * whose `handle()` returns true consumes the event and dispatch stops.
