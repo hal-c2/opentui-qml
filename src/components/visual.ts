@@ -43,7 +43,13 @@ import { QmlObject, toQmlObject } from "../runtime/object.ts"
 import { createHandler } from "../runtime/expression.ts"
 import type { QmlEngine } from "../runtime/engine.ts"
 import type { HandlerSpec, PropertyType } from "../runtime/types.ts"
-import { keyDispatcherFor, makeQmlKeyEvent, type KeyEventKind, type QmlKeyEvent } from "./key-dispatcher.ts"
+import {
+  focusKeyClaimFor,
+  keyDispatcherFor,
+  makeQmlKeyEvent,
+  type KeyEventKind,
+  type QmlKeyEvent,
+} from "./key-dispatcher.ts"
 import { connectScreenHandler } from "./screen.ts"
 
 let nextId = 0
@@ -303,10 +309,16 @@ class KeysRegistry {
     const qevent = makeQmlKeyEvent(event, false)
     const visited = new Set<QmlObject>()
     const focused = this.engine.renderer?.currentFocusedRenderable ?? null
-    for (let o: QmlObject | null = visualForRenderable(focused); o; o = o.parent) {
+    const focusedItem = visualForRenderable(focused)
+    // A focused renderable that claims the key (an EmbeddedTerminal) gets it before any QML
+    // ancestor or root handler; only the item owning it may still intercept.
+    const claimed = focusKeyClaimFor(this.engine.renderer)?.claims(event) ?? false
+    for (let o: QmlObject | null = focusedItem; o; o = o.parent) {
       visited.add(o)
+      if (claimed && o !== focusedItem) continue
       if (o instanceof Item && this.items.has(o) && o.deliverKey(qevent, kind)) return true
     }
+    if (claimed) return false
     for (const item of [...this.items]) {
       if (item.parent || visited.has(item) || item.isDestroyed) continue
       if (item.deliverKey(qevent, kind)) return true
@@ -784,7 +796,7 @@ export class Item extends VisualObject {
     }
   }
 
-  private syncFocus(focused: boolean): void {
+  protected syncFocus(focused: boolean): void {
     if (this.isDestroyed) return
     this.syncingFocus = true
     try {

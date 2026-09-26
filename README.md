@@ -127,7 +127,7 @@ custom components from sibling `.qml` files, `import "dir"`, modules with a `qml
 | `ScrollBar` | `ScrollBarRenderable` | `orientation`, two-way `position`, `scrollSize`, `viewportSize`, `scrolled(position)`, `scrollBy()` |
 | `FrameBuffer` / `Canvas` | `FrameBufferRenderable` | `paint(painter)` signal, `draw(fn)`; `drawText`, `setCell`, `fillRect`, `drawBox` |
 | `Image` | `ImageRenderable` | `source` (path/URL/bytes), `fit`, `protocol`, `status`, `loaded()`, `error(message)` |
-| `EmbeddedTerminal` / `Terminal` | `EmbeddedTerminalRenderable` | `command`/`args`/`cwd`/`env` run in a PTY, `exited(code)`, `write()`, `send()`, `screenText()` |
+| `EmbeddedTerminal` / `Terminal` | `EmbeddedTerminalRenderable` | `cols`/`rows`/`maxScrollback`; `command`/`args`/`cwd`/`env`/`term` run in a PTY (`shell: true` for `$SHELL`), `running`/`pid`/`exitCode`; `hostKeys` (keys kept by QML while focused, default Escape); `started(pid)`, `exited(code, signal)`, `input(text, source)`, `terminalResized(cols, rows)`; `write()`, `send()`, `attach(child)`, `restart()`, `kill()`, `screenText()`, `lines()`, `cursor()` |
 | `Portal` | (re-parenting) | its children are drawn inside `target` (default: the whole screen) |
 | `QRCode` (optional) | `QRCodeRenderable` | only when `@opentui/qrcode` is installed (`bun add @opentui/qrcode`); `text`, `errorCorrection` (`"L"`/`"M"`/`"Q"`/`"H"`), `color`, `backgroundColor`, `quietZone`, `scale`, `fit` |
 | `NumberAnimation` / `PropertyAnimation`, `PauseAnimation`, `SequentialAnimation`, `ParallelAnimation` | `Timeline` | `target`/`property`, `from`/`to`, `duration`, `easing.type: Easing.*`, `loops`, `running`, `started()`/`finished()` |
@@ -145,6 +145,11 @@ Solid bindings, and [`examples/`](examples/) for runnable apps.
 `Keys.onPressed` on the root sees every key; on any other item it fires while that item has or
 contains focus. Set `event.accepted = true` to stop the key from reaching the focused widget.
 `focus: true` and `forceActiveFocus()` move focus.
+
+While an `EmbeddedTerminal` has focus, every key belongs to the program running in it: `Keys.*`
+handlers on its ancestors and `Shortcut`s with the default `"window"` (or `"item"`) context are
+skipped, except for the keys listed in its `hostKeys` (default `["escape"]`) and shortcuts with
+`context: "application"`. See [`examples/terminal.qml`](examples/terminal.qml).
 
 For shortcuts that end users can rebind, use `Shortcut`, `Action`, `KeyBinding` and `Keymap`. They
 run on [`@opentui/keymap`](https://www.npmjs.com/package/@opentui/keymap) (one keymap per engine),
@@ -278,6 +283,7 @@ bun run src/cli.ts examples/table.qml        # TextTable from a model + Slider
 bun run src/cli.ts examples/animation.qml    # Sequential/Parallel NumberAnimations
 bun run src/cli.ts examples/responsive.qml   # layout driven by Screen.width
 bun run src/cli.ts examples/keymap.qml       # sequences, leader, Actions, Keyboard help footer
+bun run src/cli.ts examples/terminal.qml     # EmbeddedTerminal running $SHELL, hostKeys, restart
 bun run src/cli.ts examples/plugin-host.qml --plugins examples/plugins
 bun examples/shell/app.ts --config-dir examples/shell/rices/minimal   # shell host, see above
 ```

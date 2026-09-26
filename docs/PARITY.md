@@ -41,7 +41,7 @@ apply to QML; **missing** not implemented.
 | `<ascii-font>` | `AsciiText` / `BigText` | done |
 | `<framebuffer>` | `FrameBuffer` / `Canvas` with `paint(painter)` | done |
 | `<image>` | `Image` | done |
-| `<embedded-terminal>` | `EmbeddedTerminal` / `Terminal` | done (tests do not spawn) |
+| `<embedded-terminal>` (`cols`, `rows`, `maxScrollback`, `onData`, `onTerminalResize`, `onScreenChange`, `write`, `screen`, selection, attach-a-child pattern) | `EmbeddedTerminal` / `Terminal`: same options as properties, `input`/`rawInput`/`terminalResized`/`screenChanged` signals, `attach(child)`, plus a built-in PTY runner (`command`, `shell`, `env`, `restart()`, `kill()`) and `hostKeys` | done |
 | `<qr-code>` (`@opentui/qrcode`) | `QRCode` (`text`, `errorCorrection`, `color`, `quietZone`, `scale`, `fit`), registered only when the optional package is installed | done |
 | Slot components (`<slot>` via core slot registry) | `Slot`, `Plugin`, `Contribution` | done |
 | `<Portal>` (Solid) | `Portal { target }` | done |

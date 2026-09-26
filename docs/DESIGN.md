@@ -607,6 +607,14 @@ Keyboard.clearPendingSequence()
   - `"item"` layers target the enclosing visual item, or `Keymap.target`, with `targetMode:
     "focus-within"`.
   - `"application"` layers are always active.
+  - **Focus key claims** (`key-dispatcher.ts`): a renderable that wants (almost) the whole
+    keyboard registers a `FocusKeyClaim` with `setFocusKeyClaim`. `EmbeddedTerminal` does this
+    for its emulator: it claims every key that is not in its `hostKeys` (default `["escape"]`).
+    While it is focused, `"window"` / `"item"` layers yield the claimed keys (same
+    `qmlYieldToEditor` mechanism as the editor heuristic, which is the built-in claim of an
+    `EditBufferRenderable`), and `KeysRegistry` skips the claimed keys for every item except
+    the one owning the focused renderable. `"application"` layers still run first, which is how
+    a host keeps a quit shortcut.
 - **Commands**:
   - Command names are global, as in the package. `Keyboard.dispatch(name)` runs the
     highest-priority active layer's command of that name, and a rejection falls down the chain.
@@ -628,6 +636,27 @@ Keyboard.clearPendingSequence()
 - **Component key bindings**: `ListView`/`TabBar`/`TextInput`/`TextArea` expose a `keyBindings`
   property that is passed through to the renderable (`[{ name: "j", action: "move-down" }]`),
   plus a `keyAliasMap` passthrough.
+
+## EmbeddedTerminal (`src/components/graphics.ts`)
+
+`EmbeddedTerminalRenderable` is a VT emulator (Ghostty via the native library), not a PTY; its
+`cols`, `rows` and `maxScrollback` are fixed at construction, and it resizes itself to its
+layout size afterwards. Because an `Item` creates its renderable in the constructor, before any
+QML property is set, the QML type is a plain box that hosts the emulator as its only child,
+created in `onCompleted` from the property values (`id` = `<box id>.vt`, `width`/`height`
+`"100%"`). Consequences: `write()` before completion is queued; `focus` is forwarded
+(`applyFocus` focuses the emulator, its `focused`/`blurred` events drive `syncFocus`), so
+`renderer.currentFocusedRenderable` is the emulator while `visualForRenderable` still resolves
+to the QML item; `enabled: false` blurs it through a watcher.
+
+Bytes the emulator produces (`onData(data, source)`: key, mouse and paste encodings with source
+`"input"`, terminal query replies with `"response"`) go to the running PTY, to the `attach()`ed
+child, and out as the `rawInput` / `input` signals. `start()` spawns with `Bun.spawn(cmd, {
+terminal: { cols, rows, name, data } })`, `TERM` (the `term` property) and `COLORTERM=truecolor`
+under the user's `env`; `shell: true` or no command runs `$SHELL`. `attach(child)` is the
+integration path for a process the application owns: `child.write(bytes)` and
+`child.resize(cols, rows)` are called, the application feeds the child's output to `write()`; a
+Bun subprocess with a `terminal` can be passed as-is and is detached when it exits.
 
 ## Plugins (`src/runtime/plugins.ts`, `src/components/slot.ts`)
 

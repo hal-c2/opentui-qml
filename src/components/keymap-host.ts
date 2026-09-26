@@ -43,7 +43,7 @@ import { getGraphSnapshot, type GraphLayer } from "@opentui/keymap/extras/graph"
 import { QmlObject } from "../runtime/object.ts"
 import { createSignal, type Accessor, type Setter } from "../runtime/reactive.ts"
 import type { QmlEngine } from "../runtime/engine.ts"
-import { isPrintableSequence } from "./key-dispatcher.ts"
+import { focusKeyClaimFor, isPrintableSequence, type FocusKeyClaim } from "./key-dispatcher.ts"
 
 export type QmlKeymap = OpenTuiKeymap<Renderable, KeyEvent>
 export type QmlKeymapLayer = Layer<Renderable, KeyEvent>
@@ -283,17 +283,25 @@ export function isEditingKey(event: KeyEvent): boolean {
   return EDITING_KEY_NAMES.includes(event.name)
 }
 
-/** Stroke form of {@link isEditingKey}, for bindings (shift + a character is still typing). */
-function isEditingStroke(part: KeySequencePart): boolean {
-  const s = part.stroke
-  if (s.ctrl || s.meta || s.super || s.hyper) return false
-  return [...s.name].length === 1 || EDITING_KEY_NAMES.includes(s.name)
-}
-
 const EDITING_KEY_NAMES = ["space", "backspace", "delete", "left", "right", "home", "end", "return", "linefeed"]
 
-function editorHasFocus(renderer: CliRenderer | undefined): boolean {
-  return renderer?.currentFocusedRenderable instanceof EditBufferRenderable
+/** Editing keys of a focused TextInput / TextArea (`EditBufferRenderable`). */
+const editorClaim: FocusKeyClaim = {
+  claims: (event) => isEditingKey(event),
+  claimsStroke: (s) => {
+    if (s.ctrl || s.meta || s.super) return false
+    return [...s.name].length === 1 || EDITING_KEY_NAMES.includes(s.name)
+  },
+}
+
+/**
+ * What the focused renderable claims for itself: a registered claim (EmbeddedTerminal), else the
+ * editing-key heuristic for text editors, else nothing.
+ */
+function focusClaimFor(renderer: CliRenderer | undefined): FocusKeyClaim | null {
+  const claim = focusKeyClaimFor(renderer)
+  if (claim) return claim
+  return renderer?.currentFocusedRenderable instanceof EditBufferRenderable ? editorClaim : null
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -458,8 +466,9 @@ export class KeyboardHost {
 
   private yieldsToEditor(): boolean {
     const event = this.currentEvent
-    if (this.snapshotting || !event || !editorHasFocus(this.engine.renderer)) return false
-    if (!isEditingKey(event)) return false
+    if (this.snapshotting || !event) return false
+    const claim = focusClaimFor(this.engine.renderer)
+    if (!claim || !claim.claims(event)) return false
     return !this.keymap?.hasPendingSequence()
   }
 
@@ -607,7 +616,7 @@ export class KeyboardHost {
     }
     const layers = new Map(snap.layers.map((l) => [l.id, l]))
     const pending = opts.ignorePending ? [] : snap.pendingSequence.map((p) => p.match)
-    const editorYield = snap.pendingSequence.length === 0 && editorHasFocus(this.engine.renderer)
+    const focusClaim = snap.pendingSequence.length === 0 ? focusClaimFor(this.engine.renderer) : null
     const bindings = snap.bindings
       .filter((b) => b.event === "press" && b.active && b.reachable && !b.shadowed)
       .map((b) => ({ b, layer: layers.get(b.layerId) }))
@@ -620,7 +629,7 @@ export class KeyboardHost {
     const seen = new Set<string>()
     for (const { b, layer } of bindings) {
       if (opts.owner !== undefined && ownerOf(layer) !== opts.owner) continue
-      if (editorYield && layer.fields.qmlYieldToEditor && isEditingStroke(b.sequence[0]!)) continue
+      if (focusClaim && layer.fields.qmlYieldToEditor && focusClaim.claimsStroke(b.sequence[0]!.stroke)) continue
       if (pending.length > 0) {
         if (b.sequence.length <= pending.length) continue
         if (pending.some((m, i) => b.sequence[i]!.match !== m)) continue

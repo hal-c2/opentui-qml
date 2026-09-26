@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs"
 import { afterEach, describe, expect, test } from "bun:test"
 import {
   DiffRenderable,
@@ -247,12 +248,145 @@ describe("graphics", () => {
 
   test("EmbeddedTerminal constructs and displays written data (no process)", async () => {
     const t = await run(`EmbeddedTerminal { id: term; width: 20; height: 3 }`)
-    const r = renderableOf<EmbeddedTerminalRenderable>(t, "term")
+    const item = byId(t, "term") as any
+    const r = item.terminal as EmbeddedTerminalRenderable
     expect(r).toBeInstanceOf(EmbeddedTerminalRenderable)
-    ;(byId(t, "term").proxy as any).write("hi from vt")
+    expect(r.parent).toBe(renderableOf(t, "term"))
+    item.proxy.write("hi from vt")
     await t.renderOnce()
-    expect((byId(t, "term").proxy as any).screenText()).toContain("hi from vt")
-    expect(byId(t, "term").peek("running")).toBe(false)
+    expect(item.proxy.screenText()).toContain("hi from vt")
+    expect(item.proxy.lines()[0]).toContain("hi from vt")
+    expect(item.proxy.cursor().x).toBe(10)
+    expect(item.peek("running")).toBe(false)
+    // The emulator follows the layout size, and reports it.
+    expect(r.width).toBe(20)
+    expect(r.height).toBe(3)
+    expect(item.proxy.screen().columns).toBe(20)
+  })
+
+  test("EmbeddedTerminal queues writes before completion and honours cols/rows/maxScrollback", async () => {
+    const t = await run(`EmbeddedTerminal {
+      id: term; width: 30; height: 4; cols: 10; rows: 2; maxScrollback: 64
+      property int resizes: 0
+      property string size: ""
+      Component.onCompleted: write("early")
+      onTerminalResized: (c, r) => { resizes++; size = c + "x" + r }
+    }`)
+    await t.renderOnce()
+    const item = byId(t, "term") as any
+    expect(item.proxy.screenText()).toContain("early")
+    expect(item.peek("resizes")).toBeGreaterThan(0)
+    expect(item.peek("size")).toBe("30x4")
+  })
+
+  test("EmbeddedTerminal focus goes to the emulator and yields keys, except hostKeys", async () => {
+    const t = await run(`Column {
+      property string log: ""
+      Shortcut { sequence: "q"; onActivated: log += "q" }
+      Shortcut { sequence: "escape"; onActivated: log += "E" }
+      Shortcut { sequence: "ctrl+x"; onActivated: log += "X" }
+      Shortcut { sequence: "ctrl+q"; context: "application"; onActivated: log += "A" }
+      Keys.onPressed: (e) => { log += "k" + e.key }
+      EmbeddedTerminal { id: term; width: 20; height: 3; hostKeys: ["escape", "ctrl+x"] }
+      TextInput { id: input }
+    }`)
+    const item = byId(t, "term") as any
+    const vt = item.terminal as EmbeddedTerminalRenderable
+    const inputs: string[] = []
+    item.connect("input", (text: string, source: string) => inputs.push(`${source}:${text}`))
+    item.set("focus", true)
+    expect(vt.focused).toBe(true)
+    expect(item.peek("activeFocus")).toBe(true)
+    expect(t.renderer.currentFocusedRenderable).toBe(vt)
+
+    await t.pressKey("q")
+    await t.pressEscape()
+    await t.pressKey("x", { ctrl: true })
+    await t.pressKey("q", { ctrl: true })
+    expect(t.root.peek("log")).toBe("EXA")
+    expect(inputs).toEqual(["input:q"])
+
+    // Blur: window shortcuts and Keys handlers see everything again.
+    item.set("focus", false)
+    expect(vt.focused).toBe(false)
+    expect(item.peek("focused")).toBe(false)
+    await t.pressKey("q")
+    expect(t.root.peek("log")).toBe("EXAq")
+
+    // Focusing another item clears the claim; forceActiveFocus() brings it back.
+    byId(t, "input").set("focus", true)
+    expect(t.renderer.currentFocusedRenderable).not.toBe(vt)
+    item.proxy.forceActiveFocus()
+    expect(t.renderer.currentFocusedRenderable).toBe(vt)
+  })
+
+  test("EmbeddedTerminal attach() drives an external child and detach() stops it", async () => {
+    const t = await run(`EmbeddedTerminal { id: term; width: 20; height: 3 }`)
+    const item = byId(t, "term") as any
+    const writes: string[] = []
+    const sizes: string[] = []
+    const dec = new TextDecoder()
+    const dispose = item.proxy.attach({
+      write: (d: Uint8Array) => writes.push(dec.decode(d)),
+      resize: (c: number, r: number) => sizes.push(`${c}x${r}`),
+    })
+    expect(item.peek("attached")).toBe(true)
+    expect(sizes).toEqual(["20x3"])
+    item.proxy.send("ls\r")
+    item.set("focus", true)
+    await t.pressKey("a")
+    expect(writes).toEqual(["ls\r", "a"])
+    dispose()
+    expect(item.peek("attached")).toBe(false)
+    item.proxy.send("x")
+    expect(writes).toHaveLength(2)
+  })
+
+  const haveSh = existsSync("/bin/sh")
+  test.skipIf(!haveSh)("EmbeddedTerminal runs a command in a PTY with TERM set and reports the exit", async () => {
+    const t = await run(`EmbeddedTerminal {
+      id: term; width: 40; height: 4
+      command: "/bin/sh"; args: ["-c", "echo T=$TERM C=$COLORTERM F=$FOO; exit 3"]
+      env: ({ FOO: "bar" })
+      property int startedPid: 0
+      property string exit: ""
+      onStarted: (pid) => startedPid = pid
+      onExited: (code, signal) => exit = code + "/" + signal
+    }`)
+    const item = byId(t, "term") as any
+    expect(item.peek("running")).toBe(true)
+    expect(item.peek("pid")).toBeGreaterThan(0)
+    expect(item.peek("startedPid")).toBe(item.peek("pid"))
+    const deadline = Date.now() + 5000
+    while (item.peek("running") && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20))
+    expect(item.peek("running")).toBe(false)
+    expect(item.peek("exitCode")).toBe(3)
+    expect(item.peek("exit")).toBe("3/null")
+    await t.renderOnce()
+    expect(item.proxy.screenText()).toContain("T=xterm-256color C=truecolor F=bar")
+  })
+
+  test.skipIf(!haveSh)("EmbeddedTerminal restart() and kill() manage the process", async () => {
+    const t = await run(`EmbeddedTerminal {
+      id: term; width: 30; height: 4
+      command: ["/bin/sh", "-c", "echo up; sleep 30"]
+      property int exits: 0
+      onExited: exits++
+    }`)
+    const item = byId(t, "term") as any
+    const first = item.peek("pid")
+    expect(first).toBeGreaterThan(0)
+    expect(await item.proxy.restart()).toBe(true)
+    expect(item.peek("running")).toBe(true)
+    expect(item.peek("pid")).not.toBe(first)
+    expect(item.peek("exits")).toBe(1)
+    expect(item.proxy.kill("SIGTERM")).toBe(true)
+    const deadline = Date.now() + 5000
+    while (item.peek("running") && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20))
+    expect(item.peek("running")).toBe(false)
+    expect(item.peek("exits")).toBe(2)
+    expect(item.peek("exitSignal")).toBe("SIGTERM")
+    expect(item.proxy.kill()).toBe(false)
   })
 })
 

@@ -11,8 +11,82 @@
  * Entries are ordered by `priority` (higher first), then by registration order. The first entry
  * whose `handle()` returns true consumes the event and dispatch stops.
  */
-import type { KeyEvent } from "@opentui/core"
+import type { CliRenderer, KeyEvent, Renderable } from "@opentui/core"
 import type { QmlEngine } from "../runtime/engine.ts"
+
+// -----------------------------------------------------------------------------------------------
+// Focus key claims
+//
+// A focused renderable that consumes most of the keyboard (an EmbeddedTerminal) registers a
+// claim. While it has focus, `Keys.*` handlers of its QML ancestors and "window" / "item"
+// keymap layers yield every key it claims; "application" shortcuts and the item's own
+// `Keys.*` handlers still run first.
+
+export interface KeyStroke {
+  name: string
+  ctrl: boolean
+  shift: boolean
+  /** alt / option */
+  meta: boolean
+  super: boolean
+}
+
+export interface FocusKeyClaim {
+  /** True when the focused renderable wants this key for itself. */
+  claims(event: KeyEvent): boolean
+  /** Stroke form, for `Keyboard.activeKeys()` style listings. */
+  claimsStroke(stroke: KeyStroke): boolean
+}
+
+const focusKeyClaims = new WeakMap<Renderable, FocusKeyClaim>()
+
+/** Register (or with `null` remove) the key claim of a renderable while it is focused. */
+export function setFocusKeyClaim(renderable: Renderable, claim: FocusKeyClaim | null): void {
+  if (claim) focusKeyClaims.set(renderable, claim)
+  else focusKeyClaims.delete(renderable)
+}
+
+/** The claim of the currently focused renderable, if it registered one. */
+export function focusKeyClaimFor(renderer: CliRenderer | null | undefined): FocusKeyClaim | null {
+  const focused = renderer?.currentFocusedRenderable
+  return (focused && focusKeyClaims.get(focused)) ?? null
+}
+
+/** Canonical `ctrl+alt+shift+super+name` form of a stroke (modifiers in that order, lower case). */
+export function strokeId(s: KeyStroke): string {
+  const name = s.name.toLowerCase()
+  return `${s.ctrl ? "ctrl+" : ""}${s.meta ? "alt+" : ""}${s.shift ? "shift+" : ""}${s.super ? "super+" : ""}${name}`
+}
+
+/** Stroke of a key event (alt and option both count as alt). */
+export function eventStroke(event: KeyEvent): KeyStroke {
+  return {
+    name: event.name ?? "",
+    ctrl: !!event.ctrl,
+    shift: !!event.shift,
+    meta: !!(event.meta || event.option),
+    super: !!event.super,
+  }
+}
+
+/** Parse a user key string (`"ctrl+q"`, `"Escape"`, `"alt+x"`, `"Ctrl+Shift+C"`) into a stroke id. */
+export function parseStrokeId(text: string): string {
+  const parts = String(text).trim().split("+")
+  const s: KeyStroke = { name: "", ctrl: false, shift: false, meta: false, super: false }
+  for (let i = 0; i < parts.length; i++) {
+    const raw = parts[i]!
+    const p = raw.toLowerCase()
+    const last = i === parts.length - 1
+    if (!last && (p === "ctrl" || p === "control")) s.ctrl = true
+    else if (!last && (p === "alt" || p === "option" || p === "meta")) s.meta = true
+    else if (!last && p === "shift") s.shift = true
+    else if (!last && (p === "super" || p === "cmd" || p === "win")) s.super = true
+    else s.name = KEY_ALIASES[p] ?? p
+  }
+  return strokeId(s)
+}
+
+const KEY_ALIASES: Record<string, string> = { esc: "escape", enter: "return", " ": "space" }
 
 export type KeyEventKind = "keypress" | "keyrelease"
 
