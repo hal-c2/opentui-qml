@@ -129,14 +129,16 @@ custom components from sibling `.qml` files, `import "dir"`, modules with a `qml
 | `Image` | `ImageRenderable` | `source` (path/URL/bytes), `fit`, `protocol`, `status`, `loaded()`, `error(message)` |
 | `EmbeddedTerminal` / `Terminal` | `EmbeddedTerminalRenderable` | `command`/`args`/`cwd`/`env` run in a PTY, `exited(code)`, `write()`, `send()`, `screenText()` |
 | `Portal` | (re-parenting) | its children are drawn inside `target` (default: the whole screen) |
+| `QRCode` (optional) | `QRCodeRenderable` | only when `@opentui/qrcode` is installed (`bun add @opentui/qrcode`); `text`, `errorCorrection` (`"L"`/`"M"`/`"Q"`/`"H"`), `color`, `backgroundColor`, `quietZone`, `scale`, `fit` |
 | `NumberAnimation` / `PropertyAnimation`, `PauseAnimation`, `SequentialAnimation`, `ParallelAnimation` | `Timeline` | `target`/`property`, `from`/`to`, `duration`, `easing.type: Easing.*`, `loops`, `running`, `started()`/`finished()` |
 | `Screen` (global) | `CliRenderer` | `width`, `height`, `themeMode`, `focused`, `selectedText`, `resized()`, `notify()`, `copyToClipboard()`, console, `writeToScrollback()` |
 
 Layout is OpenTUI's Yoga flexbox, not Qt's anchors. `anchors.fill: parent` and
 `anchors.centerIn: parent` are translated; everything else uses flex properties.
 
-See [`docs/DESIGN.md`](docs/DESIGN.md) for the full mapping and semantics, and
-[`examples/`](examples/) for runnable apps.
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the full mapping and semantics,
+[`docs/PARITY.md`](docs/PARITY.md) for the feature-by-feature comparison with the React and
+Solid bindings, and [`examples/`](examples/) for runnable apps.
 
 ## Keyboard
 
@@ -288,7 +290,7 @@ import { testQml } from "opentui-qml/testing"
 const t = await testQml({ file: "examples/counter.qml" }, { width: 80, height: 24 })
 await t.pressKey("k")
 expect(await t.snapshot()).toContain("Count: 1")
-await t.advance(250) // animations advance only through advance(ms)
+await t.advance(250) // animations and QML Timers advance only through advance(ms)
 t.destroy()
 ```
 

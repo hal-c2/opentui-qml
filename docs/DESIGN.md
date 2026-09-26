@@ -69,6 +69,26 @@ Binding evaluation errors (ReferenceError, TypeError) must NOT crash the app: ca
 (`console.error` — OpenTUI captures console into its overlay), and leave the property at its
 previous value. Errors thrown inside signal handlers are logged the same way.
 
+## Binding expressions across lines (`src/parser/parser.ts`)
+
+The parser does not parse JavaScript; it finds where a `name: expression` binding ends. At bracket
+depth 0 the expression ends before `;`, before the `}` closing the object, or at a line break —
+unless the expression continues, with JavaScript ASI semantics (as in Qt's grammar):
+
+- brackets, parens, braces are unbalanced (template literals are single tokens);
+- the previous line ends with an operator (`a +`, `cond ?`, `x ? a :`, `f(`, `=>`, `,`, `.`,
+  `new`, `typeof`, ...);
+- the next line starts with a binary / ternary / member operator: `+ - * / % ** == != === < > <= >=
+  && || ?? ? : . ?. , = += ... ) ]`, `(` (call), `[` (index), a template literal (tagged), or
+  `instanceof`/`in`/`as`/`else`/`catch`/`finally`. So `x: 1` followed by a line `-1` is `1 - 1`.
+  Lines starting with `!`, `~`, `++`, `--` do not continue (JS would insert a semicolon).
+
+A next line that starts a QML member always ends the expression: `property`/`signal`/`enum`/
+`readonly`/`required`/`default`/`component`/`id:`, `Type {` / `group {`, and `name:` /
+`a.b.c:` — except that `name: value` continues while a depth-0 `?` on an earlier line is still
+waiting for its `:` (a ternary branch written as `cond ?\n  foo : bar`). Blocks (`{ ... }`) and
+function bodies are captured by bracket balancing.
+
 ## Expressions and scope
 
 Scripts are compiled once per binding/handler with `new Function`:
@@ -187,6 +207,7 @@ export interface QmlEngineOptions {
   globals?: Record<string, unknown> // extra names visible in every scope (level 6)
   basePath?: string                 // for relative imports/files
   importPaths?: string[]            // module search dirs for `import A.B.C` (default [basePath ?? cwd])
+  scheduler?: Scheduler             // timers for `Timer` / `Qt.callLater` (default: globalThis timers)
 }
 
 export class QmlEngine {
@@ -199,7 +220,14 @@ export class QmlEngine {
   loadSource(source: string, filename?: string): QmlComponent
   /** Instantiate a component. parent may be undefined for the root. */
   createObject(component: QmlComponent, parent?: QmlObject, contextProps?: Record<string, unknown>): QmlObject
-  destroy(): void
+  destroy(): void                           // runs onDestroy hooks, then destroys the roots
+  /** Run `cb` in destroy(), before the roots are destroyed, in registration order; errors are
+   *  reported via reportError. Returns a disposer. (Screen, Keyboard and the timeline detach use it.) */
+  onDestroy(cb: () => void): () => void
+  /** The `.qml` file `obj` was declared in (component context, walking up enclosing contexts). */
+  sourceFileOf(obj: QmlObject): string | undefined
+  /** Like qmlRegisterTypeNotAvailable: hasType stays false, using it fails with `message`. */
+  registerTypeNotAvailable(name: string, message: string): void
   // modules and singletons (see "Modules and singletons")
   readonly importPaths: string[]
   addImportPath(dir: string): void          // highest priority; clears the module cache
@@ -232,6 +260,11 @@ Instantiation of an `ObjectDefinition` (order matters for QML semantics):
 5. Apply all `PropertyBinding`s: literals are set directly; scripts become bindings; handlers connect.
 6. After the *entire* component tree is built and bound, call `onCompleted()` bottom-up
    (children before parents) and emit `Component.completed`.
+
+If building throws (unknown type, singleton used as a type, ...), every object the instantiation
+already created is destroyed before the error propagates, so a failed document (e.g. a broken
+user `shell.qml`) leaves nothing attached to its parent. `QmlObject.onDestroy(fn)` returns an
+unsubscribe function.
 
 Type files: a document whose root is `Item { property int foo }` used as `Foo { foo: 3 }` from
 another file: instantiate the `Foo` document's root as the object, then apply the user's
@@ -344,7 +377,8 @@ Non-visual builtins in `src/runtime/builtins.ts`: `QtObject`, `Timer`, `Repeater
 - ListView (visual, in components) also uses delegate + model; see below.
 
 `Timer { interval: 1000; running: true; repeat: true; triggeredOnStart: false; onTriggered: ... }`,
-methods `start()`, `stop()`, `restart()`. Uses `setInterval`/`setTimeout`; cleared on destroy.
+methods `start()`, `stop()`, `restart()`. Uses `engine.scheduler` (`QmlEngineOptions.scheduler`;
+default globalThis timers, `ManualScheduler` for tests); cleared on destroy.
 
 `Connections { target: someId; function onSomething(a) {} }` (Qt6 style) and legacy
 `onSomething: ...` bindings — connects to the target's signals; re-connects when `target` changes.
@@ -378,6 +412,7 @@ properties (value -> `renderable[name] = value`).
 | `Code` | `CodeRenderable` | `text`→content, `language`/`filetype`, `theme`? |
 | `Markdown` | `MarkdownRenderable` | `text`→content |
 | `Window` / `ApplicationWindow` | Box that fills the terminal | `title` (ignored), `width`/`height` default 100%; `color` → backgroundColor; only valid as root |
+| `QRCode` (optional) | `QRCodeRenderable` from `@opentui/qrcode` (an `optionalDependencies` entry) | registered only if the package loads (`registerQrCode`); otherwise `registerTypeNotAvailable` makes a use fail with "install the optional package @opentui/qrcode". `text` (aliases `value`, `content`), `errorCorrection` (L/M/Q/H or low/medium/quartile/high), `color`, `backgroundColor`, `quietZone`, `scale`, `fit`, `fallbackText`, `fallbackColor`; methods `version()`, `moduleCount()` |
 
 Colors: accept `"#rrggbb"`, `"#rgb"`, CSS names, `"transparent"`, and RGBA objects (pass through;
 OpenTUI's `parseColor` handles strings).
@@ -450,6 +485,13 @@ engine with a non-visual type registry. Component/integration tests use
 helper with `renderer` supplied, then `await renderOnce()` and assert on `captureCharFrame()`.
 Keyboard interaction via `mockInput.pressKey("ARROW_DOWN")` / `typeText`.
 
+`testQml` (`src/testing.ts`) runs the renderer on a `ManualClock` and, unless a `scheduler` is
+passed, gives the engine a `ManualScheduler` (`t.scheduler`): `advance(ms)` moves animations and
+QML `Timer`s together, stepping to each due timer (so an animation a Timer starts only gets the
+remaining time); zero-delay tasks (`Qt.callLater`) run on every render helper. A lone ESC is held
+by OpenTUI's stdin parser for 20 ms on the renderer clock, so `pressEscape()` /
+`pressKey("ESCAPE")` run that timeout and rewind the clock (no time passes for animations).
+
 ## Non-goals for v1
 
 States/Transitions/Behaviors/animations, anchors beyond `fill`/`centerIn`, `Loader` async,
@@ -467,7 +509,7 @@ version as `@opentui/core`).
 
 Each engine gets one `KeyboardHost`, created lazily by the first keymap type or the first use of
 `Keyboard`. It owns one `@opentui/keymap` `Keymap` over `createOpenTuiKeymapHost(renderer)`. The
-host is destroyed with the engine (`registerOpenTuiTypes` wraps `engine.destroy`) or with the
+host is destroyed with the engine (`registerOpenTuiTypes` registers an `engine.onDestroy` hook) or with the
 renderer. A headless engine (no renderer) has no keymap: layers are no-ops, and `Action.trigger()`
 emits locally.
 

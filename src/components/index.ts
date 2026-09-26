@@ -19,6 +19,7 @@ import { Action, KeyBinding, Keymap, Shortcut } from "./keymap.ts"
 import { Diff, LineNumbers, ScrollBar, Slider, TextTable } from "./widgets.ts"
 import { EmbeddedTerminal, FrameBuffer, Image } from "./graphics.ts"
 import { Portal } from "./portal.ts"
+import { registerQrCode } from "./qrcode.ts"
 import {
   ANIMATION_STATICS,
   EASING_GLOBAL,
@@ -90,22 +91,19 @@ const servicesInstalled = new WeakSet<QmlEngine>()
  */
 export function registerOpenTuiTypes(engine: QmlEngine): void {
   for (const [name, factory] of Object.entries(OPENTUI_TYPES)) engine.registerType(name, factory)
+  // Optional: `QRCode` only when @opentui/qrcode is installed (else a "not available" hint).
+  registerQrCode(engine)
   engine.globals.Screen = screenFor(engine).proxy
   engine.globals.Easing = EASING_GLOBAL
   engine.globals.Animation = ANIMATION_STATICS
   engine.registerSingleton("Keyboard", (e: QmlEngine) => keyboardFor(e))
   if (servicesInstalled.has(engine)) return
   servicesInstalled.add(engine)
-  // The engine has no destroy hook: wrap this instance's destroy().
-  const destroy = engine.destroy.bind(engine)
-  engine.destroy = () => {
-    const wasDestroyed = engine.isDestroyed
-    destroy()
-    if (wasDestroyed) return
+  engine.onDestroy(() => {
     screenFor(engine).destroy()
     destroyKeyboardHost(engine)
     detachTimelineEngine(engine)
-  }
+  })
 }
 
 /** Add a visual root object's renderable to the renderer's root. Returns the object. */
@@ -131,6 +129,7 @@ export { Diff, LineNumbers, ORIENTATION_STATICS, ScrollBar, Slider, TextTable } 
 export { EmbeddedTerminal, FrameBuffer, Image } from "./graphics.ts"
 export type { QmlPainter } from "./graphics.ts"
 export { Portal } from "./portal.ts"
+export { QRCODE_NOT_AVAILABLE, QRCode, loadQrCodeModule, registerQrCode } from "./qrcode.ts"
 export {
   ANIMATION_STATICS,
   Animation,

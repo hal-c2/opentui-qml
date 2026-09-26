@@ -102,6 +102,8 @@ interface BuildState {
   aliasJobs: Array<() => void>
   jobs: Array<() => void>
   completions: QmlObject[]
+  /** Every object created by this instantiation (destroyed again if building throws). */
+  created: QmlObject[]
 }
 
 interface Placement {
@@ -151,6 +153,8 @@ export class QmlEngine {
   readonly rootContext: ComponentContext = createComponentContext(null)
 
   private readonly types = new Map<string, QmlTypeFactory>()
+  /** `registerTypeNotAvailable`: type name → why it cannot be used. */
+  private readonly unavailableTypes = new Map<string, string>()
   /** Named document types (`registerDocumentType`), e.g. `types: [...]` of a QML plugin. */
   private readonly documentTypes = new Map<string, QmlComponent>()
   private readonly files = new Map<string, QmlComponent | null>()
@@ -173,6 +177,7 @@ export class QmlEngine {
   private readonly parse: (source: string, filename?: string) => QmlDocument
   private readonly onWarning?: (message: string) => void
   private readonly onError?: (error: unknown, context?: string) => void
+  private readonly destroyHooks = new Set<() => void>()
   private destroyed = false
 
   constructor(opts: QmlEngineOptions = {}) {
@@ -241,6 +246,22 @@ export class QmlEngine {
   /** Register (or replace) a native type. */
   registerType(name: string, type: QmlTypeFactory): void {
     this.types.set(name, type)
+    this.unavailableTypes.delete(name)
+  }
+
+  /**
+   * Declare that `name` is a known type that cannot be used here (like Qt's
+   * `qmlRegisterTypeNotAvailable`): `hasType(name)` stays false, and a document that uses it
+   * fails with `message` (e.g. "install the optional package @opentui/qrcode") instead of a
+   * bare "unknown type". Ignored once `name` is registered.
+   */
+  registerTypeNotAvailable(name: string, message: string): void {
+    if (!this.types.has(name)) this.unavailableTypes.set(name, message)
+  }
+
+  /** The `registerTypeNotAvailable` message for `name`, if any. */
+  typeNotAvailableReason(name: string): string | undefined {
+    return this.types.has(name) ? undefined : this.unavailableTypes.get(name)
   }
 
   /**
@@ -507,14 +528,21 @@ export class QmlEngine {
     if (this.destroyed) throw new Error("QML: engine has been destroyed")
     return untrack(() => {
       const ctx = createComponentContext(opts.component, opts.parentContext ?? null, opts.contextProperties ?? null)
-      const state: BuildState = { aliasJobs: [], jobs: [], completions: [] }
-      const obj = this.build(def, ctx, state, {
-        parent: opts.parent ?? null,
-        index: opts.index,
-        contextRoot: true,
-        deferCompletion: false,
-        direct: true,
-      })
+      const state: BuildState = { aliasJobs: [], jobs: [], completions: [], created: [] }
+      let obj: QmlObject
+      try {
+        obj = this.build(def, ctx, state, {
+          parent: opts.parent ?? null,
+          index: opts.index,
+          contextRoot: true,
+          deferCompletion: false,
+          direct: true,
+        })
+      } catch (err) {
+        // Don't leak a half-built tree (renderables attached to `parent`, subscriptions, ...).
+        this.destroyPartial(state)
+        throw err
+      }
       if (opts.contextProperties) obj.contextProperties = opts.contextProperties
       // `required property var modelData` / `required property int index` on a delegate root:
       // initialise (bind) from the same-named context property, so updates flow. This must run
@@ -566,14 +594,63 @@ export class QmlEngine {
     return scope
   }
 
+  /**
+   * The `.qml` file `obj` was declared in: the filename of its component context, walking up to
+   * enclosing contexts (delegates / inline components) when that one has none. Undefined for
+   * objects created from unnamed sources or outside any document.
+   */
+  sourceFileOf(obj: QmlObject): string | undefined {
+    for (let c: ComponentContext | null = obj.component; c; c = c.parent) {
+      const f = c.component?.filename
+      if (f) return f
+    }
+    return undefined
+  }
+
+  /** Destroy what a failed instantiation created, innermost first; teardown errors are reported. */
+  private destroyPartial(state: BuildState): void {
+    for (const obj of state.created.reverse()) {
+      if (obj.isDestroyed) continue
+      try {
+        obj.destroy()
+      } catch (err) {
+        this.reportError(err, `${obj.describe()}: destroy after a failed instantiation`)
+      }
+    }
+    state.created.length = 0
+  }
+
   /** Called by `QmlObject.destroy()`. */
   objectDestroyed(object: QmlObject): void {
     this.roots.delete(object)
   }
 
-  /** Destroy all root objects created by this engine. */
+  /**
+   * Register a callback run by {@link destroy} (once, before the root objects are destroyed),
+   * in registration order. Errors are reported through `reportError`. Returns a disposer that
+   * unregisters the callback. Registering on a destroyed engine is a no-op.
+   */
+  onDestroy(cb: () => void): () => void {
+    // Wrap so the same function may be registered twice and each disposer removes its own entry.
+    const entry = (): void => cb()
+    if (!this.destroyed) this.destroyHooks.add(entry)
+    return () => {
+      this.destroyHooks.delete(entry)
+    }
+  }
+
+  /** Run the {@link onDestroy} hooks, then destroy all root objects created by this engine. */
   destroy(): void {
     if (this.destroyed) return
+    const hooks = [...this.destroyHooks]
+    this.destroyHooks.clear()
+    for (const hook of hooks) {
+      try {
+        hook()
+      } catch (err) {
+        this.reportError(err, "engine destroy hook")
+      }
+    }
     for (const root of [...this.roots]) root.destroy()
     this.roots.clear()
     this.destroyed = true
@@ -633,6 +710,7 @@ export class QmlEngine {
       obj = this.build(resolved.component.document.root, inner, state, { ...place, contextRoot: true, deferCompletion: true })
     } else {
       obj = new resolved.factory(this, resolved.name)
+      state.created.push(obj)
       obj.component = ctx
       if (place.contextRoot) ctx.root = obj
       if (place.parent && place.direct) place.parent.appendChild(obj, place.index)
@@ -1063,7 +1141,11 @@ export class QmlComponent {
    */
   resolveType(name: string): ResolvedType {
     const resolved = this.tryResolveType(name)
-    if (!resolved) throw new Error(`${this.filename ?? "<qml>"}: unknown type "${name}"`)
+    if (!resolved) {
+      const reason = this.engine.typeNotAvailableReason(name.slice(name.lastIndexOf(".") + 1))
+      if (reason) throw new Error(`${this.filename ?? "<qml>"}: type "${name}" is not available: ${reason}`)
+      throw new Error(`${this.filename ?? "<qml>"}: unknown type "${name}"`)
+    }
     return resolved
   }
 

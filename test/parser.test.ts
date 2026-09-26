@@ -397,11 +397,70 @@ describe("expression newline heuristic", () => {
     expect(r.members.map((m) => m.type)).toEqual(["PropertyBinding", "PropertyBinding", "Object", "PropertyDeclaration"])
   })
 
-  test("next line starting with + - ( [ ! starts a new member (and errors here)", () => {
-    // `+b` on its own line is not a continuation; it is an unexpected token as a member
-    expect(() => parseQml("Item {\n  width: a\n  + b\n}")).toThrow(QmlSyntaxError)
-    expect(() => parseQml("Item {\n  width: a\n  (b)\n}")).toThrow(QmlSyntaxError)
-    expect(() => parseQml("Item {\n  width: a\n  [b]\n}")).toThrow(QmlSyntaxError)
+  test("next line starting with + - ( [ continues the expression (JS ASI, as in Qt)", () => {
+    expect(src("Item {\n  width: a\n  + b\n}", "width")).toBe("a\n  + b")
+    expect(src("Item {\n  width: a\n  (b)\n}", "width")).toBe("a\n  (b)")
+    expect(src("Item {\n  width: a\n  [b]\n}", "width")).toBe("a\n  [b]")
+  })
+
+  test("next line starting with ! ~ ++ -- does not continue (and errors as a member)", () => {
+    expect(() => parseQml("Item {\n  width: a\n  !b\n}")).toThrow(QmlSyntaxError)
+    expect(() => parseQml("Item {\n  width: a\n  ~b\n}")).toThrow(QmlSyntaxError)
+    expect(() => parseQml("Item {\n  width: a\n  ++b\n}")).toThrow(QmlSyntaxError)
+  })
+
+  test("string concatenation with + at the start of the next line", () => {
+    const r = root('Text {\n    text: "a"\n        + root.name\n        + "!"\n    x: 1\n}')
+    expect(script(binding(r, "text").value).source).toBe('"a"\n        + root.name\n        + "!"')
+    expect(bindings(r).map((b) => b.name.join("."))).toEqual(["text", "x"])
+  })
+
+  test("`x: 1` then `-1` on the next line is `1 - 1` (no literal fast path)", () => {
+    const r = root("Item {\n  x: 1\n    -1\n  y: 2\n}")
+    const v = script(binding(r, "x").value)
+    expect(v.source).toBe("1\n    -1")
+    expect(v.literal).toBeUndefined()
+    expect(script(binding(r, "y").value).literal).toEqual({ value: 2 })
+  })
+
+  test("other operators at line start: * / % == != < > = ,", () => {
+    for (const op of ["*", "/", "%", "==", "!=", "<", ">", "<=", "===", "**"]) {
+      expect(src(`Item {\n  p: a\n    ${op} b\n  q: 1\n}`, "p")).toBe(`a\n    ${op} b`)
+    }
+  })
+
+  test("ternary with ? and : at line starts", () => {
+    expect(src("Text {\n  text: cond\n    ? a\n    : b\n  x: 1\n}", "text")).toBe("cond\n    ? a\n    : b")
+  })
+
+  test("member call on the next line", () => {
+    expect(src("Item {\n  x: foo\n    .bar()\n  y: 1\n}", "x")).toBe("foo\n    .bar()")
+  })
+
+  test("array literal spanning lines followed by a method call", () => {
+    expect(src("Text {\n  text: [\n    1,\n    2\n  ].join()\n  x: 1\n}", "text")).toBe("[\n    1,\n    2\n  ].join()")
+  })
+
+  test("template literal on the next line is a tagged template", () => {
+    expect(src("Item {\n  p: tag\n    `x`\n  q: 1\n}", "p")).toBe("tag\n    `x`")
+  })
+
+  test("`name: value` after an unfinished line is a new binding unless a ternary is pending", () => {
+    const r = root("Item {\n  width: a +\n  height: 2\n}")
+    expect(script(binding(r, "width").value).source).toBe("a +")
+    expect(script(binding(r, "height").value).source).toBe("2")
+    const d = root("Item {\n  width: a ||\n  anchors.fill: parent\n}")
+    expect(bindings(d).map((b) => b.name.join("."))).toEqual(["width", "anchors.fill"])
+    // A `?` earlier in the expression makes `foo : bar` the else-branch.
+    expect(src("Item {\n  width: cond ? x\n    : y\n  z: 1\n}", "width")).toBe("cond ? x\n    : y")
+    expect(src("Item {\n  width: (c ? 1 : 2) ?\n    foo : bar\n  z: 1\n}", "width")).toBe("(c ? 1 : 2) ?\n    foo : bar")
+  })
+
+  test("consecutive bindings still parse separately", () => {
+    const r = root("Item {\n  x: 1\n  y: 2\n  text: a\n  b: c ? d : e\n  f: g\n}")
+    expect(bindings(r).map((b) => b.name.join("."))).toEqual(["x", "y", "text", "b", "f"])
+    expect(script(binding(r, "text").value).source).toBe("a")
+    expect(script(binding(r, "b").value).source).toBe("c ? d : e")
   })
 
   test("arrow functions spanning lines", () => {

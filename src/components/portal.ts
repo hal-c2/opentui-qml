@@ -12,7 +12,8 @@ import { toQmlObject } from "../runtime/object.ts"
 import { Item, isVisual } from "./visual.ts"
 
 export class Portal extends Item {
-  private mountToken = 0
+  /** Unregisters the move-to-root hook on the current target. */
+  private offTargetDestroy: (() => void) | null = null
 
   constructor(engine: QmlEngine, typeName: string) {
     super(engine, typeName)
@@ -37,20 +38,28 @@ export class Portal extends Item {
   private remount(): void {
     const r = this.renderable
     if (this.isDestroyed || r.isDestroyed) return
-    const token = ++this.mountToken
+    this.offTargetDestroy?.()
+    this.offTargetDestroy = null
     const dest = this.targetRenderable()
     if (r.parent !== dest) {
       if (r.parent) r.parent.remove(r)
       dest.add(r)
     }
     const t = toQmlObject(this.peek("target"))
-    if (isVisual(t)) {
-      t.onDestroy(() => {
-        if (token !== this.mountToken || this.isDestroyed || r.isDestroyed) return
+    if (isVisual(t) && !t.isDestroyed) {
+      this.offTargetDestroy = t.onDestroy(() => {
+        this.offTargetDestroy = null
+        if (this.isDestroyed || r.isDestroyed) return
         if (r.parent) r.parent.remove(r)
         this.engine.renderer.root.add(r)
       })
     }
+  }
+
+  override destroy(): void {
+    this.offTargetDestroy?.()
+    this.offTargetDestroy = null
+    super.destroy()
   }
 
   protected override onCompleted(): void {

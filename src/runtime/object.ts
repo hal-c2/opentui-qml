@@ -814,9 +814,17 @@ export class QmlObject {
     return stop
   }
 
-  /** Register a cleanup to run on `destroy()`. */
-  onDestroy(fn: () => void): void {
-    this.disposers.add(fn)
+  /**
+   * Register a cleanup to run on `destroy()`. Returns a function that unregisters it (a no-op
+   * once the object is destroyed).
+   */
+  onDestroy(fn: () => void): () => void {
+    // Wrap so registering the same function twice yields two independent entries.
+    const entry = (): void => fn()
+    this.disposers.add(entry)
+    return () => {
+      this.disposers.delete(entry)
+    }
   }
 
   /**

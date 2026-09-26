@@ -26,6 +26,9 @@
     "@opentui/keymap": "0.5.12",
     "solid-js": "1.9.12"
   },
+  "optionalDependencies": {
+    "@opentui/qrcode": "0.5.12"
+  },
   "devDependencies": {
     "@types/bun": "latest",
     "typescript": "^5"

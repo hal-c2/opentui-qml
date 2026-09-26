@@ -14,8 +14,8 @@ import {
 } from "@opentui/core"
 import { CliRenderer } from "@opentui/core"
 import { testQml, type QmlTestApp, type TestQmlOptions } from "../src/testing.ts"
-import { isVisual, screenFor } from "../src/components/index.ts"
-import type { QmlObject } from "../src/runtime/index.ts"
+import { isVisual, loadQrCodeModule, screenFor } from "../src/components/index.ts"
+import { ManualScheduler, toQmlObject, type QmlObject } from "../src/runtime/index.ts"
 
 let current: QmlTestApp | null = null
 
@@ -583,5 +583,148 @@ describe("new examples", () => {
     await t.advance(750)
     expect(await t.snapshot()).toContain("] 100%")
     expect(t.errors).toEqual([])
+  })
+})
+
+describe("engine teardown hooks", () => {
+  test("Screen and Keyboard are torn down through engine.onDestroy (no destroy() wrapper)", async () => {
+    const t = await run(`Item { property var kb: Keyboard; Text { text: Screen.width } }`)
+    expect(Object.hasOwn(t.engine, "destroy")).toBe(false)
+    const screen = screenFor(t.engine)
+    const keyboard = toQmlObject(t.proxy.kb)!
+    expect(keyboard.isDestroyed).toBe(false)
+    t.engine.destroy()
+    expect(screen.isDestroyed).toBe(true)
+    expect(keyboard.isDestroyed).toBe(true)
+    expect(t.root.isDestroyed).toBe(true)
+  })
+})
+
+describe("Portal retargeting", () => {
+  test("the old target's destroy hook is dropped when the target changes", async () => {
+    const t = await run(`
+      Column {
+        Rectangle { id: a; width: 20; height: 2 }
+        Rectangle { id: b; width: 20; height: 2 }
+        Portal { id: portal; target: a; Text { text: "p" } }
+      }`)
+    const a = byId(t, "a")
+    const b = byId(t, "b")
+    const portal = byId(t, "portal")
+    if (!isVisual(b) || !isVisual(portal)) throw new Error("not visual")
+    portal.set("target", b)
+    expect(portal.renderable.parent).toBe(b.contentRenderable)
+    a.destroy()
+    expect(portal.renderable.parent).toBe(b.contentRenderable)
+    b.destroy()
+    expect(portal.renderable.parent).toBe(t.renderer.root)
+  })
+})
+
+describe("testQml manual clock", () => {
+  test("QML Timer runs on advance(ms)", async () => {
+    const t = await run(`
+      Item {
+        property int count: 0
+        Timer { interval: 100; running: true; repeat: true; onTriggered: count++ }
+      }`)
+    expect(t.scheduler).not.toBeNull()
+    expect(t.proxy.count).toBe(0)
+    await t.advance(350)
+    expect(t.proxy.count).toBe(3)
+    await t.advance(50)
+    expect(t.proxy.count).toBe(4)
+  })
+
+  test("a one-shot Timer that stops itself, and Qt.callLater on the next render", async () => {
+    const t = await run(`
+      Item {
+        property int shots: 0
+        property int later: 0
+        Timer { id: once; interval: 30; running: true; onTriggered: shots++ }
+        function bump() { later++ }
+        Component.onCompleted: Qt.callLater(bump)
+      }`)
+    await t.renderOnce()
+    expect(t.proxy.later).toBe(1)
+    await t.advance(100)
+    expect(t.proxy.shots).toBe(1)
+  })
+
+  test("an animation started by a Timer gets only the remaining time", async () => {
+    const t = await run(`
+      Item {
+        property real v: 0
+        NumberAnimation { id: anim; target: parent; property: "v"; from: 0; to: 100; duration: 100 }
+        Timer { interval: 50; running: true; onTriggered: anim.start() }
+      }`)
+    await t.advance(100)
+    expect(t.proxy.v).toBeGreaterThan(30)
+    expect(t.proxy.v).toBeLessThan(70)
+  })
+
+  test("pressEscape / pressKey('ESCAPE') are delivered without advancing time", async () => {
+    const t = await run(`
+      Item {
+        property string log: ""
+        focus: true
+        Keys.onPressed: (e) => log += e.key + ";"
+      }`)
+    const before = t.clock!.now()
+    await t.pressEscape()
+    expect(t.proxy.log).toBe("escape;")
+    await t.pressKey("ESCAPE")
+    await t.pressKey("a")
+    expect(t.proxy.log).toBe("escape;escape;a;")
+    expect(t.clock!.now()).toBe(before)
+  })
+
+  test("a caller-supplied scheduler is used as is", async () => {
+    const scheduler = new ManualScheduler()
+    const t = await run(`Item { property int n: 0; Timer { interval: 10; running: true; onTriggered: n++ } }`, { scheduler })
+    expect(t.scheduler).toBeNull()
+    await t.advance(20)
+    expect(t.proxy.n).toBe(0)
+    scheduler.advance(10)
+    expect(t.proxy.n).toBe(1)
+  })
+})
+
+describe("optional QRCode", () => {
+  const installed = loadQrCodeModule() !== null
+
+  test.if(!installed)("without @opentui/qrcode, QRCode is not a type and says what to install", async () => {
+    const t = await run(`Item {}`)
+    expect(t.engine.hasType("QRCode")).toBe(false)
+    let message = ""
+    try {
+      await testQml(`import OpenTUI\nItem { QRCode { text: "hi" } }`, { width: 10, height: 4 })
+    } catch (err) {
+      message = (err as Error).message
+    }
+    expect(message).toContain('type "QRCode" is not available')
+    expect(message).toContain("install the optional package @opentui/qrcode")
+  })
+
+  test.if(installed)("with @opentui/qrcode, QRCode renders", async () => {
+    const t = await run(`Item { QRCode { id: qr; text: "hello"; errorCorrection: "high" } }`, { width: 40, height: 20 })
+    expect(t.engine.hasType("QRCode")).toBe(true)
+    expect((byId(t, "qr") as any).renderable.errorCorrectionLevel).toBe("H")
+    expect(await t.snapshot()).toContain("█")
+  })
+})
+
+describe("failed instantiation", () => {
+  test("a document failing half-way leaves no renderables behind", async () => {
+    const t = await run(`Column { id: host }`)
+    const host = byId(t, "host")
+    if (!isVisual(host)) throw new Error("not visual")
+    const rootChildren = t.renderer.root.getChildren().length
+    const component = t.engine.loadSource(`import OpenTUI\nItem { Text { text: "leak" } Bogus {} }`)
+    expect(() => t.engine.createObject(component, host)).toThrow(/unknown type "Bogus"/)
+    expect(host.children).toHaveLength(0)
+    expect(host.contentRenderable.getChildren()).toHaveLength(0)
+    expect(t.renderer.root.getChildren().length).toBe(rootChildren)
+    expect(await t.snapshot()).not.toContain("leak")
   })
 })

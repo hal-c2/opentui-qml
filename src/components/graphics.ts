@@ -36,7 +36,6 @@ import {
 } from "@opentui/core"
 import { dirname, isAbsolute, resolve } from "node:path"
 import type { QmlEngine } from "../runtime/engine.ts"
-import type { ComponentContext } from "../runtime/types.ts"
 import { Item, nextRenderableId, toColor } from "./visual.ts"
 
 function rgba(v: unknown, fallback: string): RGBA {
@@ -190,14 +189,6 @@ export class FrameBuffer extends Item {
 // -----------------------------------------------------------------------------------------------
 // Image
 
-function componentDirectory(ctx: ComponentContext | null): string | undefined {
-  for (let c = ctx; c; c = c.parent) {
-    const f = c.component?.filename
-    if (f) return dirname(f)
-  }
-  return undefined
-}
-
 const URL_RE = /^[a-z][a-z0-9+.-]*:/i
 
 export class Image extends Item {
@@ -228,13 +219,18 @@ export class Image extends Item {
     }
   }
 
+  private sourceDirectory(): string | undefined {
+    const file = this.engine.sourceFileOf(this)
+    return file ? dirname(file) : undefined
+  }
+
   private applySource(v: unknown): void {
     const r = this.renderable
     if (r.isDestroyed) return
     let src = v
     if (typeof src === "string") {
       if (src.startsWith("file://")) src = new URL(src).pathname
-      else if (!URL_RE.test(src) && !isAbsolute(src)) src = resolve(componentDirectory(this.component) ?? this.engine.basePath ?? ".", src)
+      else if (!URL_RE.test(src) && !isAbsolute(src)) src = resolve(this.sourceDirectory() ?? this.engine.basePath ?? ".", src)
     }
     const empty = src === undefined || src === null || src === ""
     r.source = empty ? undefined : (src as ImageRenderable["source"])

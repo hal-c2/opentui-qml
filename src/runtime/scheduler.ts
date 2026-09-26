@@ -44,6 +44,13 @@ export class ManualScheduler implements Scheduler {
     return this.tasks.size
   }
 
+  /** Virtual time at which the earliest pending task is due (undefined when none). */
+  get nextDue(): number | undefined {
+    let due: number | undefined
+    for (const t of this.tasks.values()) if (due === undefined || t.due < due) due = t.due
+    return due
+  }
+
   /** Advance virtual time, running due tasks in order (tasks scheduled meanwhile included). */
   advance(ms: number): void {
     const end = this.now + ms

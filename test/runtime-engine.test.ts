@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test"
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { ManualScheduler, QmlEngine, QmlObject } from "../src/runtime/index.ts"
+import { ManualScheduler, QmlEngine, QmlObject, toQmlObject } from "../src/runtime/index.ts"
 import type { HandlerSpec } from "../src/runtime/index.ts"
 import { bind, doc, fn, obj, prop, signal } from "./helpers/ast.ts"
 
@@ -415,5 +415,93 @@ Item {
   test("unknown type throws", () => {
     const { engine } = setup()
     expect(() => engine.createObject(engine.loadSource(`Nope {}`))).toThrow(/unknown type "Nope"/)
+  })
+})
+
+describe("engine and object lifecycle hooks", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qml-hooks-"))
+  afterAll(() => rmSync(dir, { recursive: true, force: true }))
+
+  test("engine.onDestroy runs once, in registration order, before roots; disposer removes", () => {
+    const { engine, load, errors } = setup()
+    const root = load(`Item { width: 3 }`)
+    const log: string[] = []
+    engine.onDestroy(() => log.push(`a:${root.isDestroyed}`))
+    const off = engine.onDestroy(() => log.push("removed"))
+    engine.onDestroy(() => {
+      throw new Error("boom")
+    })
+    engine.onDestroy(() => log.push("c"))
+    off()
+    off()
+    engine.destroy()
+    engine.destroy()
+    expect(log).toEqual(["a:false", "c"])
+    expect(root.isDestroyed).toBe(true)
+    expect(errors.map((e) => (e as Error).message)).toEqual(["boom"])
+    // Registering on a destroyed engine is a no-op (and its disposer is harmless).
+    engine.onDestroy(() => log.push("late"))()
+    expect(log).toEqual(["a:false", "c"])
+  })
+
+  test("QmlObject.onDestroy returns an unsubscribe function", () => {
+    const { load } = setup()
+    const root = load(`Item {}`)
+    const log: string[] = []
+    const fn = () => log.push("x")
+    const offA = root.onDestroy(fn)
+    root.onDestroy(fn)
+    const offB = root.onDestroy(() => log.push("b"))
+    offA()
+    offB()
+    root.destroy()
+    expect(log).toEqual(["x"])
+    offA() // no-op after destroy
+  })
+
+  test("sourceFileOf: the declaring document, walking up to enclosing contexts", async () => {
+    const { engine } = setup()
+    const file = join(dir, "Source.qml")
+    writeFileSync(file, `Item { Item { id: inner } property Component c: Component { Item {} } }`)
+    const root = (await engine.loadFile(file)).createObject()
+    expect(engine.sourceFileOf(root)).toBe(file)
+    expect(engine.sourceFileOf(root.children[0]!)).toBe(file)
+    const made = toQmlObject((root.get("c") as { createObject(): unknown }).createObject())!
+    expect(engine.sourceFileOf(made)).toBe(file)
+    expect(engine.sourceFileOf(engine.createObject(engine.loadSource(`Item {}`)))).toBeUndefined()
+  })
+
+  test("registerTypeNotAvailable: hasType stays false, use fails with the message", () => {
+    const { engine } = setup()
+    engine.registerTypeNotAvailable("Fancy", "install fancy-pkg")
+    expect(engine.hasType("Fancy")).toBe(false)
+    expect(() => engine.createObject(engine.loadSource(`Item { Fancy {} }`))).toThrow(
+      /type "Fancy" is not available: install fancy-pkg/,
+    )
+    engine.registerType("Fancy", Item)
+    expect(engine.hasType("Fancy")).toBe(true)
+    expect(() => engine.createObject(engine.loadSource(`Fancy {}`))).not.toThrow()
+  })
+
+  test("a failed instantiation destroys the objects it already created", () => {
+    const { engine } = setup()
+    const made: QmlObject[] = []
+    class Probe extends Item {
+      constructor(e: QmlEngine, t: string) {
+        super(e, t)
+        made.push(this)
+      }
+    }
+    engine.registerType("Probe", Probe)
+    const parent = engine.createObject(engine.loadSource(`Item {}`))
+    expect(() =>
+      engine.createObject(engine.loadSource(`Probe { Probe { Probe {} } Nope {} Probe {} }`), parent),
+    ).toThrow(/unknown type "Nope"/)
+    expect(made).toHaveLength(3)
+    expect(made.every((o) => o.isDestroyed)).toBe(true)
+    expect(parent.children).toHaveLength(0)
+    // The engine does not hold on to the failed root: destroy() only touches `parent`.
+    engine.destroy()
+    expect(parent.isDestroyed).toBe(true)
   })
 })

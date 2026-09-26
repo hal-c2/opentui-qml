@@ -64,14 +64,16 @@ const CONTINUES_AFTER_KEYWORD = new Set([
 
 /**
  * If the next line starts with one of these punctuators, it cannot begin a new
- * member, so it continues the expression. Deliberately NOT included: `+`, `-`,
- * `(`, `[`, `!`, `~`, `++`, `--`, template literals — QML treats those as the
- * start of something new (like JS ASI would for most of them in QML context).
+ * member, so it continues the expression — JavaScript ASI semantics, which is
+ * what Qt's QML grammar uses: `x: 1\n  - 1` is `1 - 1`, `a\n  (b)` is `a(b)`,
+ * `a\n  [0]` is `a[0]` (a template literal on the next line is likewise a
+ * tagged template). Deliberately NOT included: `!`, `~` (JS would insert a
+ * semicolon: `a !b` is invalid) and `++`/`--` (restricted productions).
  */
 const CONTINUES_BEFORE_PUNCT = new Set([
   ...ASSIGNMENT_OPERATORS,
   ...BINARY_OPERATORS,
-  ".", "?.", "?", ":", ",", "=>", ")", "]",
+  ".", "?.", "?", ":", ",", "=>", ")", "]", "+", "-", "(", "[",
 ])
 
 /** Keywords that, at the start of the next line, continue the expression / statement. */
@@ -512,6 +514,10 @@ class Parser {
    * - before the `}` closing the enclosing object,
    * - at a line break, unless the expression is obviously unfinished
    *   (see `continuesAcrossNewline`).
+   *
+   * `pendingTernary` counts depth-0 `?` not yet matched by a `:`; while it is
+   * positive a next line of the form `name: value` is a ternary branch rather
+   * than a new binding.
    */
   private scanExpression(): ScriptBinding {
     const first = this.peek()
@@ -520,6 +526,7 @@ class Parser {
     }
     const startIndex = this.i
     const stack: Token[] = []
+    let pendingTernary = 0
     let last = first
     for (;;) {
       const tok = this.peek()
@@ -533,7 +540,7 @@ class Parser {
       if (stack.length === 0 && tok !== first) {
         if (this.isPunct(tok, ";") || this.isPunct(tok, "}")) break
         if (tok.newlineBefore) {
-          if (!this.continuesAcrossNewline(last)) break
+          if (!this.continuesAcrossNewline(last, pendingTernary > 0)) break
         } else if (this.isValueEnd(last) && this.isValueStart(tok)) {
           this.error(`unexpected ${describe(tok)}: expected ';' or newline between members`, tok)
         }
@@ -541,6 +548,8 @@ class Parser {
       if (tok.type === "punctuator") {
         if (OPENERS[tok.value]) stack.push(tok)
         else if (CLOSERS.has(tok.value)) this.popMatching(stack, tok)
+        else if (stack.length === 0 && tok.value === "?") pendingTernary++
+        else if (stack.length === 0 && tok.value === ":" && pendingTernary > 0) pendingTernary--
       }
       last = this.next()
     }
@@ -556,18 +565,23 @@ class Parser {
    * line; `last` is the final token on the previous line. Returns true if the
    * expression continues onto the next line.
    */
-  private continuesAcrossNewline(last: Token): boolean {
+  private continuesAcrossNewline(last: Token, inTernary: boolean): boolean {
     const next = this.peek()
     // 1. The next line unambiguously starts a new QML member: stop, even if the
     //    previous line looks unfinished (it is then a syntax error in the script,
     //    reported by the runtime, instead of swallowing the next member).
     if (this.looksLikeMemberStart()) return false
+    //    `name: value` / `a.b: value` is a new binding unless a `?` on an earlier
+    //    line is still waiting for its `:` (then it is the ternary's branch).
+    if (!inTernary && this.looksLikeBindingStart()) return false
     // 2. The previous line is obviously unfinished (`a +`, `cond ?`, `(m) =>`).
     if (last.type === "punctuator" && CONTINUES_AFTER_PUNCT.has(last.value)) return true
     if (last.type === "identifier" && CONTINUES_AFTER_KEYWORD.has(last.value)) return true
     // 3. The next line starts with a token that cannot start a member (`.foo()`, `? a`, `&& b`).
     if (next.type === "punctuator" && CONTINUES_BEFORE_PUNCT.has(next.value)) return true
     if (next.type === "identifier" && CONTINUES_BEFORE_KEYWORD.has(next.value)) return true
+    // A template literal cannot start a member either: JS reads it as a tagged template.
+    if (next.type === "template") return true
     return false
   }
 
@@ -599,6 +613,14 @@ class Parser {
     let j = 1
     while (this.isPunct(this.peek(j), ".") && this.isIdent(this.peek(j + 1))) j += 2
     return this.isPunct(this.peek(j), "{")
+  }
+
+  /** `ident(.ident)* :` at the current position (a binding, or a ternary branch). */
+  private looksLikeBindingStart(): boolean {
+    if (this.peek().type !== "identifier") return false
+    let j = 1
+    while (this.isPunct(this.peek(j), ".") && this.isIdent(this.peek(j + 1))) j += 2
+    return this.isPunct(this.peek(j), ":")
   }
 
   /** Token that can end an operand (used for the same-line adjacency check). */
