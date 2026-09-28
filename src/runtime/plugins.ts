@@ -197,7 +197,7 @@ class PluginHost {
   report(failure: PluginFailure, where: string): void {
     this.engine.reportError(failure.error, where)
     if (this.root) this.emit(failure)
-    else if (this.pending.length < 100) this.pending.push(failure)
+    else this.pending.push(failure)
   }
 
   flush(): void {
