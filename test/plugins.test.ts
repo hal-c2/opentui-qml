@@ -395,6 +395,25 @@ describe("QML plugins", () => {
     expect(listPlugins(h.app.engine).map((p) => p.id).sort()).toEqual(["good", "renderfail"])
   })
 
+  test("failures before the root exists reach its pluginError signal once it is set", async () => {
+    const h = await mount(
+      `Item {
+         width: 40; height: 4
+         signal pluginError(var error)
+         onPluginError: (error) => log.push(error.pluginId + ":" + error.phase)
+         Slot { name: "status"; flexDirection: "row" }
+       }`,
+      {
+        plugins: [{ id: "good", slots: {} }],
+        pluginDirs: [join(FIXTURES, "plugins-broken")],
+      },
+    )
+    await h.frame()
+    expect(h.log).toContain("broken:load")
+    expect(h.log).toContain("good:register")
+    expect(h.log.some((l) => l.startsWith("renderfail:"))).toBe(true)
+  })
+
   test("loadQmlPlugin rejects documents whose root is not a Plugin", async () => {
     const h = await mount(`Item { width: 10; height: 2 }`)
     await expect(loadQmlPlugin(h.app.engine, join(FIXTURES, "plugins", "Badge.qml"))).rejects.toThrow(

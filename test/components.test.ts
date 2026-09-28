@@ -346,6 +346,27 @@ describe("containers and misc", () => {
     expect(s.errors).toEqual([])
   })
 
+  test("Markdown emphasis and Code tokens are styled by the default palette", async () => {
+    const s = await setup(
+      `Window {
+        Markdown { height: 1; text: "some **strong** words" }
+        Code { height: 1; text: "const answer = 42"; filetype: "javascript" }
+      }`,
+      40,
+      4,
+    )
+    const spansOf = (row: number) => s.t.captureSpans().lines[row]!.spans.filter((span) => span.text.trim() !== "")
+    const styled = () =>
+      spansOf(0).some((span) => span.text.includes("strong") && (span.attributes & 1) === 1) &&
+      new Set(spansOf(1).map((span) => span.fg.toString())).size > 1
+    for (let i = 0; i < 50 && !styled(); i++) {
+      await tick(20)
+      await s.render()
+    }
+    expect(s.frame()).toContain("some strong words")
+    expect(styled()).toBe(true)
+  })
+
   test("mouse signals report local coordinates", async () => {
     const s = await setup(`Window {
       property var clickedAt: null

@@ -35,7 +35,6 @@ import {
   ScrollBarRenderable,
   SliderRenderable,
   StyledText,
-  SyntaxStyle,
   TextAttributes,
   TextTableRenderable,
   type Renderable,
@@ -48,6 +47,7 @@ import { resolveModel } from "../runtime/builtins.ts"
 import { untrack } from "../runtime/reactive.ts"
 import { Item, isVisual, nextRenderableId, toColor } from "./visual.ts"
 import { TEXT_STATICS, toWrapMode } from "./text.ts"
+import { defaultSyntaxStyle } from "./misc.ts"
 
 function str(v: unknown): string {
   return v === undefined || v === null ? "" : String(v)
@@ -114,7 +114,7 @@ export class Diff extends Item {
     return new DiffRenderable(engine.renderer, {
       id: nextRenderableId(typeName),
       diff: "",
-      syntaxStyle: SyntaxStyle.create(),
+      syntaxStyle: defaultSyntaxStyle(),
     })
   }
 

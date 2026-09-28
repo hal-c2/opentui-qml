@@ -9,7 +9,7 @@
  * - `Code` (CodeRenderable): `text` (alias `content`), `filetype`, `conceal`, `wrapMode`,
  *   `color`, `backgroundColor`. Without a tree-sitter client the code is drawn unstyled.
  *
- * Markdown and Code get a default `SyntaxStyle`.
+ * Markdown and Code get a default `SyntaxStyle` (see {@link defaultSyntaxStyle}).
  */
 import {
   ASCIIFontRenderable,
@@ -21,6 +21,40 @@ import {
 import type { QmlEngine } from "../runtime/engine.ts"
 import { Item, nextRenderableId, toColor } from "./visual.ts"
 import { TEXT_STATICS, toWrapMode } from "./text.ts"
+
+/**
+ * A small default palette for tree-sitter and Markdown scopes, so `Code` is highlighted and
+ * Markdown emphasis is styled without the app supplying a `SyntaxStyle`.
+ */
+export function defaultSyntaxStyle(): SyntaxStyle {
+  return SyntaxStyle.fromStyles({
+    default: {},
+    keyword: { fg: "#c678dd" },
+    "keyword.function": { fg: "#c678dd" },
+    "keyword.return": { fg: "#c678dd" },
+    string: { fg: "#98c379" },
+    number: { fg: "#d19a66" },
+    boolean: { fg: "#d19a66" },
+    constant: { fg: "#d19a66" },
+    "constant.builtin": { fg: "#d19a66" },
+    comment: { fg: "#7f848e", italic: true },
+    function: { fg: "#61afef" },
+    "function.call": { fg: "#61afef" },
+    "function.method": { fg: "#61afef" },
+    type: { fg: "#e5c07b" },
+    "type.builtin": { fg: "#e5c07b" },
+    property: { fg: "#e06c75" },
+    operator: { fg: "#56b6c2" },
+    punctuation: { fg: "#abb2bf" },
+    "markup.heading": { bold: true },
+    "markup.strong": { bold: true },
+    "markup.italic": { italic: true },
+    "markup.raw": { fg: "#98c379" },
+    "markup.link": { underline: true },
+    "markup.link.label": { underline: true },
+    "markup.link.url": { fg: "#61afef", underline: true },
+  })
+}
 
 function str(v: unknown): string {
   return v === undefined || v === null ? "" : String(v)
@@ -72,7 +106,7 @@ export class Markdown extends Item {
     return new MarkdownRenderable(engine.renderer, {
       id: nextRenderableId(typeName),
       content: "",
-      syntaxStyle: SyntaxStyle.create(),
+      syntaxStyle: defaultSyntaxStyle(),
     })
   }
 
@@ -100,7 +134,7 @@ export class Code extends Item {
     return new CodeRenderable(engine.renderer, {
       id: nextRenderableId(typeName),
       content: "",
-      syntaxStyle: SyntaxStyle.create(),
+      syntaxStyle: defaultSyntaxStyle(),
       drawUnstyledText: true,
     })
   }

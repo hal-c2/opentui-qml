@@ -13,7 +13,8 @@
  *
  * Plugin failures never throw into the host: the registry isolates setup/render/dispose
  * errors and reports them to `engine.reportError` (and to a `pluginError` signal on the
- * application root, if the root declares one).
+ * application root, if the root declares one). Failures before the root exists, such as a
+ * broken plugin file or a failing first render, are delivered when `setPluginRoot` sets it.
  */
 import { readdirSync, statSync } from "node:fs"
 import { basename, extname, join, resolve } from "node:path"
@@ -181,25 +182,42 @@ class PluginHost {
     this.offError = this.registry.onPluginError((event) => this.onPluginError(event))
   }
 
+  /** Failures reported before the root exists; delivered once `setPluginRoot` sets one. */
+  private pending: PluginFailure[] = []
+
   private onPluginError(event: PluginErrorEvent): void {
     const where = `${event.phase}${event.slot ? `, slot "${event.slot}"` : ""}`
-    this.engine.reportError(event.error, `plugin "${event.pluginId}" (${where})`)
+    this.report({ pluginId: event.pluginId, slot: event.slot, phase: event.phase, error: event.error }, `plugin "${event.pluginId}" (${where})`)
+  }
+
+  /**
+   * Report a plugin failure to `engine.reportError` and to the root's `pluginError` signal.
+   * Failures before the root exists (plugin loading, the first Slot renders) are queued.
+   */
+  report(failure: PluginFailure, where: string): void {
+    this.engine.reportError(failure.error, where)
+    if (this.root) this.emit(failure)
+    else this.pending.push(failure)
+  }
+
+  flush(): void {
+    const pending = this.pending
+    this.pending = []
+    for (const failure of pending) this.emit(failure)
+  }
+
+  private emit(failure: PluginFailure): void {
     const root = this.root
     if (root && !root.isDestroyed && root.hasSignal("pluginError")) {
-      root.emit("pluginError", {
-        pluginId: event.pluginId,
-        slot: event.slot,
-        phase: event.phase,
-        message: event.error.message,
-        error: event.error,
-      })
+      root.emit("pluginError", { ...failure, message: failure.error.message })
     }
   }
 
   /** Register `plugin`; returns false (after reporting) on a duplicate id or failing setup. */
   add(entry: PluginEntry, plugin: CorePlugin<string, QmlSlotContext, QmlSlotData>): boolean {
     if (this.entries.has(entry.id)) {
-      this.engine.reportError(new Error(`plugin "${entry.id}" is already registered`), "registerPlugin")
+      const error = new Error(`plugin "${entry.id}" is already registered`)
+      this.report({ pluginId: entry.id, phase: "register", error }, "registerPlugin")
       return false
     }
     let setupOk = true
@@ -218,7 +236,7 @@ class PluginHost {
     try {
       off = registerCorePlugin(this.registry, plugin)
     } catch (err) {
-      this.engine.reportError(err, `plugin "${entry.id}"`)
+      this.report({ pluginId: entry.id, phase: "register", error: toError(err) }, `plugin "${entry.id}"`)
       return false
     }
     // A failing `setup` leaves the plugin unregistered (the registry reported the error).
@@ -266,6 +284,25 @@ export function setPluginRoot(engine: QmlEngine, root: QmlObject | null): void {
   const h = host(engine)
   h.root = root
   h.context.root = root?.proxy ?? null
+  if (root) h.flush()
+}
+
+/** A plugin failure as delivered to the root's `pluginError(var error)` signal. */
+export interface PluginFailure {
+  pluginId: string
+  slot?: string
+  phase: string
+  error: Error
+}
+
+function toError(err: unknown): Error {
+  return err instanceof Error ? err : new Error(String(err))
+}
+
+/** Report a failure through the engine's plugin host when it has one (engines with a renderer). */
+function reportPluginFailure(engine: QmlEngine, failure: PluginFailure, where: string): void {
+  if (engine.renderer) host(engine).report(failure, where)
+  else engine.reportError(failure.error, where)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -721,7 +758,8 @@ export async function loadPluginsFromDir(engine: QmlEngine, dir: string): Promis
       if (!isPluginDocument(component)) continue
       loaded.push(await loadQmlPlugin(engine, file))
     } catch (err) {
-      engine.reportError(err, `plugin "${file}"`)
+      const pluginId = basename(file, extname(file))
+      reportPluginFailure(engine, { pluginId, phase: "load", error: toError(err) }, `plugin "${file}"`)
     }
   }
   return loaded
@@ -736,7 +774,8 @@ export async function addPlugin(engine: QmlEngine, plugin: AnyPlugin | string): 
     try {
       await loadQmlPlugin(engine, plugin)
     } catch (err) {
-      engine.reportError(err, `plugin "${plugin}"`)
+      const pluginId = basename(plugin, extname(plugin))
+      reportPluginFailure(engine, { pluginId, phase: "load", error: toError(err) }, `plugin "${plugin}"`)
     }
     return
   }
